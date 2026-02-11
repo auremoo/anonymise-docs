@@ -8,12 +8,14 @@ Dépendances :
   pip install requests python-docx pymupdf
 """
 
+import io
 import re
 import sys
 import json
 import time
 import argparse
 import datetime
+import threading
 from pathlib import Path
 from collections import defaultdict
 from typing import Callable
@@ -57,9 +59,14 @@ class Logger:
             "llm_passes": 0,
             "llm_chunks_traites": 0,
             "llm_erreurs": 0,
+            "images_trouvees": 0,
             "verif_warnings": [],
             "duree_totale": 0,
+            "annule": False,
         }
+
+    def elapsed(self) -> str:
+        return f"{time.time() - self.start_time:.0f}s"
 
     def log(self, level: str, message: str, progress: float | None = None):
         timestamp = time.time() - self.start_time
@@ -67,36 +74,57 @@ class Logger:
         self.entries.append(entry)
         # Affichage console
         icons = {"INFO": "📄", "REGEX": "🔍", "CUSTOM": "🏷️", "LLM": "🤖",
-                 "VERIF": "🔎", "OK": "✅", "WARN": "⚠️", "ERROR": "❌", "DONE": "✅"}
+                 "VERIF": "🔎", "OK": "✅", "WARN": "⚠️", "ERROR": "❌",
+                 "DONE": "✅", "STOP": "🛑", "IMG": "🖼️"}
         icon = icons.get(level, "•")
         print(f"  {icon} [{timestamp:6.1f}s] {message}")
-        # Callback pour l'UI
         if self.on_progress and progress is not None:
-            self.on_progress(message, progress)
+            self.on_progress(f"{message} — {self.elapsed()}", progress)
 
-    def generate_report(self, regex_anon, llm_entity_map) -> str:
+    def generate_report(self, regex_anon, llm_entity_map,
+                        images_folder: str = "") -> str:
         """Génère le rapport Markdown complet."""
         self.stats["duree_totale"] = round(time.time() - self.start_time, 2)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         lines = [
             "# Rapport d'anonymisation",
-            f"",
+            "",
             f"**Date :** {now}  ",
             f"**Fichier source :** `{self.stats['fichier_source']}`  ",
             f"**Taille originale :** {self.stats['taille_originale']} caractères  ",
             f"**Taille finale :** {self.stats['taille_finale']} caractères  ",
             f"**Durée totale :** {self.stats['duree_totale']}s  ",
-            "",
-            "---",
-            "",
         ]
+
+        if self.stats["annule"]:
+            lines.append("**Statut : ANNULÉ par l'utilisateur**  ")
+
+        if self.stats["images_trouvees"] > 0:
+            lines.append(
+                f"**Images extraites :** {self.stats['images_trouvees']}  "
+            )
+            if images_folder:
+                lines.append(f"**Dossier images :** `{images_folder}`  ")
+            lines.append("")
+            lines.append(
+                f"> ⚠️ **{self.stats['images_trouvees']} image(s) extraite(s) "
+                "et sauvegardée(s) dans un dossier séparé.** "
+                "Les placeholders `[IMAGE_N]` dans le texte anonymisé "
+                "correspondent aux fichiers numérotés dans le dossier. "
+                "Vérifiez manuellement chaque image avant de la partager "
+                "(logos, signatures, captures d'écran avec données visibles)."
+            )
+
+        lines += ["", "---", ""]
 
         # Table mots custom
         if self.stats["custom_remplacements"] > 0:
             lines.append("## Passe 0 — Mots personnalisés")
             lines.append("")
-            lines.append(f"**{self.stats['custom_remplacements']} remplacement(s)**")
+            lines.append(
+                f"**{self.stats['custom_remplacements']} remplacement(s)**"
+            )
             lines.append("")
 
         # Table regex
@@ -108,7 +136,9 @@ class Logger:
         if regex_anon.mapping:
             lines.append("| Tag | Catégorie | Valeur originale |")
             lines.append("|-----|-----------|-----------------|")
-            for key, tag in sorted(regex_anon.mapping.items(), key=lambda x: x[1]):
+            for key, tag in sorted(
+                regex_anon.mapping.items(), key=lambda x: x[1]
+            ):
                 cat, original = key.split("::", 1)
                 lines.append(f"| `{tag}` | {cat} | `{original}` |")
             lines.append("")
@@ -117,15 +147,17 @@ class Logger:
         lines.append("## Passe 2 & 3 — LLM (entités nommées)")
         lines.append("")
         lines.append(f"**Passes LLM :** {self.stats['llm_passes']}  ")
-        lines.append(f"**Chunks traités :** {self.stats['llm_chunks_traites']}  ")
+        lines.append(
+            f"**Chunks traités :** {self.stats['llm_chunks_traites']}  "
+        )
         lines.append(f"**Erreurs LLM :** {self.stats['llm_erreurs']}  ")
         lines.append("")
 
         if llm_entity_map:
-            lines.append("**Entités détectées par le LLM (extraction automatique) :**")
+            lines.append("**Entités détectées par le LLM :**")
             lines.append("")
-            lines.append("| Tag | Occurrences trouvées |")
-            lines.append("|-----|---------------------|")
+            lines.append("| Tag | Occurrences |")
+            lines.append("|-----|------------|")
             for tag, count in sorted(llm_entity_map.items()):
                 lines.append(f"| `{tag}` | {count} |")
             lines.append("")
@@ -141,11 +173,7 @@ class Logger:
         lines.append("")
 
         # Log complet
-        lines.append("---")
-        lines.append("")
-        lines.append("## Journal complet")
-        lines.append("")
-        lines.append("```")
+        lines += ["---", "", "## Journal complet", "", "```"]
         for e in self.entries:
             lines.append(f"[{e['t']:6.1f}s] [{e['level']:5s}] {e['msg']}")
         lines.append("```")
@@ -162,13 +190,8 @@ def apply_custom_words(
     custom_words: dict[str, str],
     regex_anon: "RegexAnonymizer",
 ) -> tuple[str, int]:
-    """
-    Remplace les mots custom avant la passe regex.
-    custom_words = {"Jean Dupont": "PERSONNE", "Acme Corp": "ENTREPRISE", ...}
-    Retourne (texte_modifié, nombre_de_remplacements).
-    """
+    """Remplace les mots custom avant la passe regex."""
     count = 0
-    # Trier par longueur décroissante pour éviter les remplacements partiels
     for word, category in sorted(custom_words.items(), key=lambda x: -len(x[0])):
         if not word.strip():
             continue
@@ -196,52 +219,72 @@ class RegexAnonymizer:
         return self.mapping[key]
 
     def anonymize(self, text: str) -> str:
-        # IPv4
+        # ── IP v4 ──
         text = re.sub(
-            r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
-            lambda m: self._get_tag("IP", m.group(0)), text
-        )
-        # IPv6
+            r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}'
+            r'(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
+            lambda m: self._get_tag("IP", m.group(0)), text)
+        # ── IP v6 ──
         text = re.sub(
             r'\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b',
-            lambda m: self._get_tag("IP", m.group(0)), text
-        )
-        # FQDN
+            lambda m: self._get_tag("IP", m.group(0)), text)
+        # ── FQDN ──
         text = re.sub(
-            r'\b[a-zA-Z][a-zA-Z0-9\-]*\.(?:[a-zA-Z0-9\-]+\.)*(?:local|lan|internal|corp|intra|net|com|fr|org|eu|io|de|uk|it|es)\b',
-            lambda m: self._get_tag("SERVEUR", m.group(0)), text
-        )
-        # Emails
+            r'\b[a-zA-Z][a-zA-Z0-9\-]*\.'
+            r'(?:[a-zA-Z0-9\-]+\.)*'
+            r'(?:local|lan|internal|corp|intra|net|com|fr|org|eu|io|'
+            r'de|uk|it|es)\b',
+            lambda m: self._get_tag("SERVEUR", m.group(0)), text)
+        # ── Email ──
         text = re.sub(
             r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',
-            lambda m: self._get_tag("EMAIL", m.group(0)), text
-        )
-        # Téléphones (>=8 chiffres)
-        text = re.sub(
-            r'(?:\+?\d{1,3}[\s.\-]?)?(?:\(?\d{1,4}\)?[\s.\-]?){2,4}\d{2,4}',
-            lambda m: self._get_tag("TEL", m.group(0)) if len(re.sub(r'\D', '', m.group(0))) >= 8 else m.group(0),
-            text
-        )
-        # Dates FR (JJ/MM/AAAA, JJ.MM.AAAA, JJ-MM-AAAA)
+            lambda m: self._get_tag("EMAIL", m.group(0)), text)
+        # ── Dates (AVANT téléphone pour éviter 29-01-2026 → TEL) ──
         text = re.sub(
             r'\b\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}\b',
-            lambda m: self._get_tag("DATE", m.group(0)), text
-        )
-        # Dates ISO (AAAA-MM-JJ)
+            lambda m: self._get_tag("DATE", m.group(0)), text)
         text = re.sub(
             r'\b\d{4}-\d{2}-\d{2}\b',
-            lambda m: self._get_tag("DATE", m.group(0)), text
-        )
-        # Chemins UNC Windows
+            lambda m: self._get_tag("DATE", m.group(0)), text)
+        # French written dates: "4 février 2026", "1er mars 2025"
+        text = re.sub(
+            r'\b\d{1,2}(?:er)?\s+(?:janvier|février|mars|avril|mai|juin|'
+            r'juillet|août|septembre|octobre|novembre|décembre)\s+\d{4}\b',
+            lambda m: self._get_tag("DATE", m.group(0)), text,
+            flags=re.IGNORECASE)
+        # English written dates: "4 February 2026", "March 1, 2025"
+        text = re.sub(
+            r'\b\d{1,2}\s+(?:January|February|March|April|May|June|'
+            r'July|August|September|October|November|December)\s+\d{4}\b',
+            lambda m: self._get_tag("DATE", m.group(0)), text,
+            flags=re.IGNORECASE)
+        text = re.sub(
+            r'\b(?:January|February|March|April|May|June|'
+            r'July|August|September|October|November|December)'
+            r'\s+\d{1,2},?\s+\d{4}\b',
+            lambda m: self._get_tag("DATE", m.group(0)), text,
+            flags=re.IGNORECASE)
+        # ── Téléphone (strict : doit commencer par 0X, +XX, ou 00XX) ──
+        # Séparateurs = espace, point, tiret (PAS newline/tab)
+        # Pattern 1 : FR  0X XX XX XX XX
+        # Pattern 2 : Int +XX X XX XX XX XX
+        # Pattern 3 : Int 00XX X XX XX XX XX (séparateur requis après indicatif)
+        text = re.sub(
+            r'\b0[1-9](?:[ .\-]?\d{2}){4}\b'
+            r'|\+\d{1,3}[ .\-]?\(?\d{1,4}\)?(?:[ .\-]?\d{2,4}){2,5}\b'
+            r'|\b00\d{2,3}[ .\-]\(?\d{1,4}\)?(?:[ .\-]?\d{2,4}){2,5}\b',
+            lambda m: self._get_tag("TEL", m.group(0))
+            if 8 <= len(re.sub(r'\D', '', m.group(0))) <= 15
+            else m.group(0),
+            text)
+        # ── Chemins UNC ──
         text = re.sub(
             r'\\\\[a-zA-Z0-9\-_.]+(?:\\[a-zA-Z0-9\-_. ]+)+',
-            lambda m: self._get_tag("CHEMIN", m.group(0)), text
-        )
-        # Chemins Linux absolus avec noms suspects (ex: /home/jdupont/)
+            lambda m: self._get_tag("CHEMIN", m.group(0)), text)
+        # ── Chemins Linux /home ──
         text = re.sub(
             r'/home/[a-zA-Z][a-zA-Z0-9._\-]+',
-            lambda m: self._get_tag("CHEMIN", m.group(0)), text
-        )
+            lambda m: self._get_tag("CHEMIN", m.group(0)), text)
         return text
 
 
@@ -265,7 +308,7 @@ RÈGLES :
 1. Même entité = même tag partout (ex: "Dupont" → toujours [PERSONNE_1]).
 2. NE modifie RIEN d'autre : pas de reformulation, correction, ajout ou suppression.
 3. Préserve le formatage : markdown, listes, tableaux, retours à la ligne.
-4. Tags existants ([IP_1], [EMAIL_1], [DATE_1], [TEL_1], [SERVEUR_1], [CHEMIN_1]) → INTACTS.
+4. Tags existants ([IP_1], [EMAIL_1], [DATE_1], [TEL_1], [SERVEUR_1], [CHEMIN_1], [IMAGE_1]...) → INTACTS.
 5. En cas de doute → NE remplace PAS.
 
 NE SONT PAS DES ENTITÉS (ne pas remplacer) :
@@ -304,7 +347,7 @@ POUR CHAQUE OUBLI TROUVÉ :
 - Si l'entité correspond à un tag existant, réutilise ce tag
 
 NE TOUCHE PAS :
-- Aux tags déjà en place ([PERSONNE_1], [IP_1], [LIEU_1], [ENTREPRISE_1], [REF_1], etc.)
+- Aux tags déjà en place ([PERSONNE_1], [IP_1], [LIEU_1], [ENTREPRISE_1], [REF_1], [IMAGE_1]... etc.)
 - Aux termes techniques (SCADA, WinCC, OPC UA, PLC, Siemens, Schneider, etc.)
 - Au formatage, à la structure, à la ponctuation
 
@@ -314,14 +357,10 @@ Retourne UNIQUEMENT le texte. Aucun commentaire."""
 
 
 def call_ollama_chat(text: str, system_prompt: str, model: str = "gpt-oss:20b",
-                     base_url: str = "http://localhost:11434", timeout: int = 300) -> tuple[str, bool]:
-    """
-    Appelle Ollama via /api/chat pour bénéficier du template harmony.
-    Retourne (texte_résultat, succès_bool).
-    """
+                     base_url: str = "http://localhost:11434",
+                     timeout: int = 300) -> tuple[str, bool]:
     if not HAS_REQUESTS:
         return text, False
-
     try:
         response = requests.post(
             f"{base_url}/api/chat",
@@ -329,14 +368,15 @@ def call_ollama_chat(text: str, system_prompt: str, model: str = "gpt-oss:20b",
                 "model": model,
                 "messages": [
                     {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": f"Voici le texte à traiter :\n\n{text}"}
+                    {"role": "user",
+                     "content": f"Voici le texte à traiter :\n\n{text}"}
                 ],
                 "stream": False,
                 "options": {
-                    "temperature": 0.05,  # Quasi-déterministe
+                    "temperature": 0.05,
                     "top_p": 0.9,
                     "num_predict": 8192,
-                    "num_ctx": 32768,      # Contexte généreux
+                    "num_ctx": 32768,
                 }
             },
             timeout=timeout
@@ -344,31 +384,124 @@ def call_ollama_chat(text: str, system_prompt: str, model: str = "gpt-oss:20b",
         response.raise_for_status()
         data = response.json()
         result = data.get("message", {}).get("content", "")
-
         if not result.strip():
             return text, False
-
-        return result.strip(), True
-
-    except requests.exceptions.ConnectionError:
-        return text, False
-    except requests.exceptions.Timeout:
+        result = result.strip()
+        # Strip markdown code blocks that some models wrap around output
+        if result.startswith("```") and result.endswith("```"):
+            lines = result.split("\n")
+            if len(lines) >= 3:
+                result = "\n".join(lines[1:-1]).strip()
+        return result, True
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
         return text, False
     except Exception:
         return text, False
 
 
 # =============================================================================
-# LECTURE DE FICHIERS
+# LECTURE DE FICHIERS + EXTRACTION D'IMAGES
 # =============================================================================
 
+# Word XML namespaces
+_W_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
+_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+
+def _extract_docx_image_rels(doc) -> dict[str, tuple[bytes, str]]:
+    """Map relationship IDs to (image_bytes, extension) from a docx."""
+    image_rels = {}
+    for rel_id, rel in doc.part.rels.items():
+        if "image" in rel.reltype:
+            blob = rel.target_part.blob
+            ct = rel.target_part.content_type or "image/png"
+            ext = ct.split("/")[-1]
+            if ext == "jpeg":
+                ext = "jpg"
+            image_rels[rel_id] = (blob, ext)
+    return image_rels
+
+
+def _read_docx_with_images(data: bytes) -> tuple[str, list[tuple[bytes, str]]]:
+    """Read docx → (text with [IMAGE_N] placeholders, [(bytes, ext), ...])."""
+    doc = Document(io.BytesIO(data))
+    image_rels = _extract_docx_image_rels(doc)
+    images: list[tuple[bytes, str]] = []
+    img_counter = 0
+    parts: list[str] = []
+
+    for para in doc.paragraphs:
+        para_parts: list[str] = []
+        for child in para._element:
+            tag = child.tag
+            # <w:r> — run element
+            if tag == f"{{{_W_NS}}}r":
+                has_image = False
+                for blip in child.iter(f"{{{_A_NS}}}blip"):
+                    embed = blip.get(f"{{{_R_NS}}}embed")
+                    if embed and embed in image_rels:
+                        img_counter += 1
+                        images.append(image_rels[embed])
+                        para_parts.append(f" [IMAGE_{img_counter}] ")
+                        has_image = True
+                if not has_image:
+                    for t_elem in child.iter(f"{{{_W_NS}}}t"):
+                        if t_elem.text:
+                            para_parts.append(t_elem.text)
+        parts.append("".join(para_parts))
+
+    # Tables
+    for table in doc.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                parts.append(cell.text)
+
+    return "\n".join(parts), images
+
+
+def _read_pdf_with_images(data: bytes) -> tuple[str, list[tuple[bytes, str]]]:
+    """Read PDF → (text with [IMAGE_N] placeholders, [(bytes, ext), ...])."""
+    doc = fitz.open(stream=data, filetype="pdf")
+    images: list[tuple[bytes, str]] = []
+    img_counter = 0
+    parts: list[str] = []
+
+    for page in doc:
+        page_text = page.get_text()
+        # Extract images from this page
+        page_images = page.get_images(full=True)
+        if page_images:
+            img_refs: list[str] = []
+            for img_info in page_images:
+                xref = img_info[0]
+                try:
+                    base_image = doc.extract_image(xref)
+                except Exception:
+                    continue
+                if base_image and base_image.get("image"):
+                    img_counter += 1
+                    ext = base_image.get("ext", "png")
+                    images.append((base_image["image"], ext))
+                    img_refs.append(f"[IMAGE_{img_counter}]")
+            if img_refs:
+                page_text += "\n" + "\n".join(img_refs) + "\n"
+        parts.append(page_text)
+
+    doc.close()
+    return "\n".join(parts), images
+
+
 def read_file(filepath: Path) -> str:
+    """Read file as plain text (no image extraction)."""
     suffix = filepath.suffix.lower()
-    if suffix in (".md", ".txt", ".csv", ".log", ".conf", ".ini", ".yaml", ".yml", ".json", ".xml"):
+    if suffix in (".md", ".txt", ".csv", ".log", ".conf", ".ini",
+                   ".yaml", ".yml", ".json", ".xml"):
         return filepath.read_text(encoding="utf-8")
     elif suffix == ".docx":
         if not HAS_DOCX:
-            print("❌ pip install python-docx", file=sys.stderr); sys.exit(1)
+            print("❌ pip install python-docx", file=sys.stderr)
+            sys.exit(1)
         doc = Document(str(filepath))
         parts = [p.text for p in doc.paragraphs]
         for table in doc.tables:
@@ -378,7 +511,8 @@ def read_file(filepath: Path) -> str:
         return "\n".join(parts)
     elif suffix == ".pdf":
         if not HAS_PDF:
-            print("❌ pip install pymupdf", file=sys.stderr); sys.exit(1)
+            print("❌ pip install pymupdf", file=sys.stderr)
+            sys.exit(1)
         doc = fitz.open(str(filepath))
         text = "\n".join(page.get_text() for page in doc)
         doc.close()
@@ -387,18 +521,41 @@ def read_file(filepath: Path) -> str:
         try:
             return filepath.read_text(encoding="utf-8")
         except UnicodeDecodeError:
-            print(f"❌ Format non supporté : {suffix}", file=sys.stderr); sys.exit(1)
+            print(f"❌ Format non supporté : {suffix}", file=sys.stderr)
+            sys.exit(1)
+
+
+def read_file_with_images(
+    filepath: Path,
+) -> tuple[str, list[tuple[bytes, str]]]:
+    """Read file with image extraction.
+    Returns (text_with_IMAGE_placeholders, [(image_bytes, extension), ...]).
+    For text-only formats, images list is empty.
+    """
+    suffix = filepath.suffix.lower()
+    if suffix == ".docx":
+        if not HAS_DOCX:
+            print("❌ pip install python-docx", file=sys.stderr)
+            sys.exit(1)
+        return _read_docx_with_images(filepath.read_bytes())
+    elif suffix == ".pdf":
+        if not HAS_PDF:
+            print("❌ pip install pymupdf", file=sys.stderr)
+            sys.exit(1)
+        return _read_pdf_with_images(filepath.read_bytes())
+    else:
+        return read_file(filepath), []
 
 
 def read_file_bytes(data: bytes, filename: str) -> str:
-    """Lit un fichier depuis des bytes en mémoire (pour Streamlit file_uploader)."""
+    """Read file from bytes in memory (text only, no image extraction)."""
     suffix = Path(filename).suffix.lower()
-    if suffix in (".md", ".txt", ".csv", ".log", ".conf", ".ini", ".yaml", ".yml", ".json", ".xml"):
+    if suffix in (".md", ".txt", ".csv", ".log", ".conf", ".ini",
+                   ".yaml", ".yml", ".json", ".xml"):
         return data.decode("utf-8")
     elif suffix == ".docx":
         if not HAS_DOCX:
             raise ImportError("python-docx requis : pip install python-docx")
-        import io
         doc = Document(io.BytesIO(data))
         parts = [p.text for p in doc.paragraphs]
         for table in doc.tables:
@@ -417,54 +574,78 @@ def read_file_bytes(data: bytes, filename: str) -> str:
         return data.decode("utf-8")
 
 
+def read_file_bytes_with_images(
+    data: bytes, filename: str,
+) -> tuple[str, list[tuple[bytes, str]]]:
+    """Read file from bytes with image extraction.
+    Returns (text_with_IMAGE_placeholders, [(image_bytes, extension), ...]).
+    """
+    suffix = Path(filename).suffix.lower()
+    if suffix == ".docx":
+        if not HAS_DOCX:
+            raise ImportError("python-docx requis : pip install python-docx")
+        return _read_docx_with_images(data)
+    elif suffix == ".pdf":
+        if not HAS_PDF:
+            raise ImportError("pymupdf requis : pip install pymupdf")
+        return _read_pdf_with_images(data)
+    else:
+        return read_file_bytes(data, filename), []
+
+
+def save_images(
+    images: list[tuple[bytes, str]], output_dir: Path,
+) -> list[str]:
+    """Save extracted images to a directory.
+    Images are named IMAGE_1.ext, IMAGE_2.ext, etc.
+    Returns list of saved filenames.
+    """
+    if not images:
+        return []
+    output_dir.mkdir(parents=True, exist_ok=True)
+    filenames: list[str] = []
+    for i, (img_data, ext) in enumerate(images, 1):
+        fname = f"IMAGE_{i}.{ext}"
+        (output_dir / fname).write_bytes(img_data)
+        filenames.append(fname)
+    return filenames
+
+
 # =============================================================================
 # DÉCOUPAGE
 # =============================================================================
 
 def split_into_chunks(text: str, max_chars: int = 4000) -> list[str]:
-    """Découpe en essayant de couper aux doubles sauts de ligne, puis aux lignes."""
     if len(text) <= max_chars:
         return [text]
-
-    # Essai découpe par paragraphes (double newline)
     paragraphs = re.split(r'\n\s*\n', text)
-    chunks = []
-    current = []
-    current_len = 0
-
+    chunks, current, current_len = [], [], 0
     for para in paragraphs:
-        para_len = len(para) + 2  # +2 pour \n\n
+        para_len = len(para) + 2
         if current_len + para_len > max_chars and current:
             chunks.append("\n\n".join(current))
-            current = [para]
-            current_len = para_len
+            current, current_len = [para], para_len
         else:
             current.append(para)
             current_len += para_len
-
     if current:
         chunks.append("\n\n".join(current))
-
-    # Vérifie que chaque chunk ne dépasse pas (sinon re-split par ligne)
     final_chunks = []
     for chunk in chunks:
         if len(chunk) <= max_chars:
             final_chunks.append(chunk)
         else:
-            sub_current = []
-            sub_len = 0
+            sub_current, sub_len = [], 0
             for line in chunk.split("\n"):
                 ll = len(line) + 1
                 if sub_len + ll > max_chars and sub_current:
                     final_chunks.append("\n".join(sub_current))
-                    sub_current = [line]
-                    sub_len = ll
+                    sub_current, sub_len = [line], ll
                 else:
                     sub_current.append(line)
                     sub_len += ll
             if sub_current:
                 final_chunks.append("\n".join(sub_current))
-
     return final_chunks
 
 
@@ -474,35 +655,35 @@ def split_into_chunks(text: str, max_chars: int = 4000) -> list[str]:
 
 def post_check(text: str) -> list[str]:
     warnings = []
-
-    # IPs
     ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', text)
     if ips:
-        warnings.append(f"IPs potentiellement restantes : {', '.join(set(ips))}")
-
-    # Emails
-    emails = re.findall(r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b', text)
+        warnings.append(
+            f"IPs potentiellement restantes : {', '.join(set(ips))}"
+        )
+    emails = re.findall(
+        r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b', text
+    )
     if emails:
-        warnings.append(f"Emails potentiellement restants : {', '.join(set(emails))}")
-
-    # FQDN
+        warnings.append(
+            f"Emails potentiellement restants : {', '.join(set(emails))}"
+        )
     fqdns = re.findall(
-        r'\b[a-zA-Z][a-zA-Z0-9\-]*\.(?:[a-zA-Z0-9\-]+\.)*(?:local|lan|internal|corp|intra)\b', text
+        r'\b[a-zA-Z][a-zA-Z0-9\-]*\.'
+        r'(?:[a-zA-Z0-9\-]+\.)*'
+        r'(?:local|lan|internal|corp|intra)\b',
+        text,
     )
     if fqdns:
-        warnings.append(f"FQDN internes restants : {', '.join(set(fqdns))}")
-
+        warnings.append(
+            f"FQDN internes restants : {', '.join(set(fqdns))}"
+        )
     return warnings
 
 
 def count_llm_tags(text: str) -> dict[str, int]:
-    """Compte les tags LLM insérés pour le rapport."""
-    tags = re.findall(r'\[(PERSONNE|ENTREPRISE|SITE|PROJET|LIEU|REF)_\d+\]', text)
-    counts = defaultdict(int)
-    for tag in tags:
-        counts[tag] += 1
-    # Regroupe par tag complet
-    full_tags = re.findall(r'\[(?:PERSONNE|ENTREPRISE|SITE|PROJET|LIEU|REF)_\d+\]', text)
+    full_tags = re.findall(
+        r'\[(?:PERSONNE|ENTREPRISE|SITE|PROJET|LIEU|REF)_\d+\]', text
+    )
     tag_counts = defaultdict(int)
     for t in full_tags:
         tag_counts[t] += 1
@@ -510,15 +691,13 @@ def count_llm_tags(text: str) -> dict[str, int]:
 
 
 # =============================================================================
-# UTILITAIRES (pour l'UI)
+# UTILITAIRES
 # =============================================================================
 
-def check_ollama(base_url: str = "http://localhost:11434",
-                 model: str = "gpt-oss:20b") -> tuple[bool, str, list[str]]:
-    """
-    Vérifie la connexion Ollama et la disponibilité du modèle.
-    Retourne (connecté, message, liste_modèles).
-    """
+def check_ollama(
+    base_url: str = "http://localhost:11434",
+    model: str = "gpt-oss:20b",
+) -> tuple[bool, str, list[str]]:
     if not HAS_REQUESTS:
         return False, "Module 'requests' non installé", []
     try:
@@ -536,8 +715,62 @@ def check_ollama(base_url: str = "http://localhost:11434",
 
 
 # =============================================================================
-# PIPELINE PRINCIPAL (appelable depuis CLI ou UI)
+# PIPELINE PRINCIPAL
 # =============================================================================
+
+def _run_llm_pass(chunks, system_prompt, pass_name, log, model, ollama_url,
+                  timeout, cancel_flag, on_progress,
+                  done_chunks_ref, total_chunks):
+    """Execute one LLM pass on a list of chunks. Returns result list."""
+    log.stats["llm_passes"] += 1
+    result_chunks = []
+    for i, chunk in enumerate(chunks, 1):
+        if cancel_flag and cancel_flag.is_set():
+            log.log("STOP", "Annulé par l'utilisateur.")
+            log.stats["annule"] = True
+            result_chunks.append(chunk)
+            continue
+        progress = 0.2 + (done_chunks_ref[0] / total_chunks) * 0.65
+        log.log(
+            "LLM",
+            f"  {pass_name} [{i}/{len(chunks)}] ({len(chunk)} chars)...",
+            progress=progress,
+        )
+        result, success = call_ollama_chat(
+            chunk, system_prompt,
+            model=model, base_url=ollama_url, timeout=timeout,
+        )
+        if success:
+            if result.strip() == chunk.strip():
+                log.log(
+                    "WARN",
+                    f"  {pass_name} [{i}/{len(chunks)}] "
+                    "LLM n'a fait aucun changement.",
+                )
+                log.stats["llm_no_change"] = (
+                    log.stats.get("llm_no_change", 0) + 1
+                )
+            else:
+                log.log(
+                    "OK", f"  {pass_name} [{i}/{len(chunks)}] traité."
+                )
+        else:
+            log.log(
+                "ERROR" if "Passe 2" in pass_name else "WARN",
+                f"  {pass_name} [{i}/{len(chunks)}] erreur — texte conservé.",
+            )
+            log.stats["llm_erreurs"] += 1
+        result_chunks.append(result)
+        log.stats["llm_chunks_traites"] += 1
+        done_chunks_ref[0] += 1
+        progress = 0.2 + (done_chunks_ref[0] / total_chunks) * 0.65
+        if on_progress:
+            on_progress(
+                f"{pass_name} — chunk {i}/{len(chunks)} — {log.elapsed()}",
+                progress,
+            )
+    return result_chunks
+
 
 def run_pipeline(
     text: str,
@@ -550,146 +783,106 @@ def run_pipeline(
     passes: int = 2,
     timeout: int = 300,
     on_progress: Callable[[str, float], None] | None = None,
+    cancel_flag: threading.Event | None = None,
+    images_count: int = 0,
+    images_folder: str = "",
 ) -> dict:
     """
-    Exécute la pipeline d'anonymisation complète.
-
-    Retourne un dict avec :
-      - text: texte anonymisé
-      - mapping: dict tag → valeur originale
-      - report: rapport markdown
-      - warnings: liste de warnings
-      - stats: statistiques d'exécution
+    Execute the full anonymization pipeline.
+    Returns {text, mapping, report, warnings, stats}.
     """
     log = Logger(on_progress=on_progress)
     log.stats["fichier_source"] = filename
     log.stats["taille_originale"] = len(text)
+    log.stats["images_trouvees"] = images_count
 
-    log.log("INFO", f"Début anonymisation de {filename} ({len(text)} caractères)", progress=0.0)
+    log.log(
+        "INFO",
+        f"Début anonymisation de {filename} ({len(text)} caractères)",
+        progress=0.0,
+    )
 
-    # ── Passe 0 : Mots personnalisés ──────────────────────────
+    if images_count > 0:
+        log.log("IMG", f"{images_count} image(s) extraite(s) du document.")
+
+    # ── Passe 0 : Mots personnalisés ─────────────────────────
     regex_anon = RegexAnonymizer()
 
     if custom_words:
-        log.log("CUSTOM", f"Passe 0 : {len(custom_words)} mot(s) personnalisé(s)...", progress=0.05)
+        log.log(
+            "CUSTOM",
+            f"Passe 0 : {len(custom_words)} mot(s) personnalisé(s)...",
+            progress=0.05,
+        )
         text, custom_count = apply_custom_words(text, custom_words, regex_anon)
         log.stats["custom_remplacements"] = custom_count
-        log.log("CUSTOM", f"{custom_count} remplacement(s) de mots personnalisés.")
-        for word, cat in custom_words.items():
-            if word.strip():
-                log.log("CUSTOM", f"  [{cat.upper()}] ← {word}")
+        log.log("CUSTOM", f"{custom_count} remplacement(s).")
 
-    # ── Passe 1 : Regex ────────────────────────────────────────
-    log.log("REGEX", "Passe 1 : Anonymisation regex (IP, email, date, tél, FQDN, chemins)...", progress=0.1)
+    # ── Passe 1 : Regex ──────────────────────────────────────
+    log.log("REGEX", "Passe 1 : Anonymisation regex...", progress=0.1)
     text = regex_anon.anonymize(text)
-    log.stats["regex_remplacements"] = len(regex_anon.mapping) - (len(custom_words) if custom_words else 0)
-    log.log("REGEX", f"{log.stats['regex_remplacements']} patterns regex remplacés.")
+    log.stats["regex_remplacements"] = (
+        len(regex_anon.mapping) - (len(custom_words) if custom_words else 0)
+    )
+    log.log(
+        "REGEX", f"{log.stats['regex_remplacements']} patterns regex remplacés."
+    )
 
-    for key, tag in regex_anon.mapping.items():
-        cat, val = key.split("::", 1)
-        log.log("REGEX", f"  {tag} ← {val}")
-
-    # ── Passes LLM ────────────────────────────────────────────
+    # ── Passes LLM ───────────────────────────────────────────
     llm_entity_map = {}
+    cancelled = cancel_flag and cancel_flag.is_set()
 
-    if use_llm:
-        # Vérification connexion Ollama
-        log.log("LLM", f"Test connexion Ollama ({ollama_url})...", progress=0.15)
+    if use_llm and not cancelled:
+        log.log(
+            "LLM",
+            f"Test connexion Ollama ({ollama_url})...",
+            progress=0.15,
+        )
         connected, msg, _ = check_ollama(ollama_url, model)
         if not connected:
-            log.log("ERROR", f"Connexion Ollama impossible : {msg}")
-            log.log("ERROR", "Lance 'ollama serve' et réessaie.")
-            # On continue en mode regex-only plutôt que de planter
-            log.log("WARN", "Fallback en mode regex uniquement.")
+            log.log("ERROR", f"Ollama : {msg}")
+            log.log("WARN", "Fallback regex uniquement.")
             use_llm = False
 
-    if use_llm:
-        log.log("OK", f"Ollama OK. Modèle {model}.")
+    if use_llm and not cancelled:
+        log.log("OK", f"Ollama OK — {model}.", progress=0.18)
         chunks = split_into_chunks(text, chunk_size)
         total_chunks = len(chunks) * min(passes, 3)
-        done_chunks = 0
+        done_ref = [0]  # mutable for pass-by-reference
 
-        # --- Passe 2 : Anonymisation principale ---
-        log.log("LLM", f"Passe 2 : Anonymisation NER ({len(chunks)} chunk(s), modèle {model})...",
-                progress=0.2)
-        log.stats["llm_passes"] += 1
-        result_chunks = []
-        for i, chunk in enumerate(chunks, 1):
-            log.log("LLM", f"  Chunk [{i}/{len(chunks)}] ({len(chunk)} chars)...")
-            result, success = call_ollama_chat(
-                chunk, SYSTEM_PROMPT_PASS2,
-                model=model, base_url=ollama_url, timeout=timeout
-            )
-            if success:
-                log.log("OK", f"  Chunk [{i}/{len(chunks)}] traité.")
-            else:
-                log.log("ERROR", f"  Chunk [{i}/{len(chunks)}] erreur — texte original conservé.")
-                log.stats["llm_erreurs"] += 1
-            result_chunks.append(result)
-            log.stats["llm_chunks_traites"] += 1
-            done_chunks += 1
-            progress = 0.2 + (done_chunks / total_chunks) * 0.65
-            if on_progress:
-                on_progress(f"Passe 2 — chunk {i}/{len(chunks)}", progress)
-
+        # Passe 2
+        result_chunks = _run_llm_pass(
+            chunks, SYSTEM_PROMPT_PASS2, "Passe 2", log, model, ollama_url,
+            timeout, cancel_flag, on_progress, done_ref, total_chunks,
+        )
         text = "\n\n".join(result_chunks)
 
-        # --- Passe 3 : Vérification LLM ---
-        if passes >= 2:
+        # Passe 3
+        if passes >= 2 and not (cancel_flag and cancel_flag.is_set()):
             chunks2 = split_into_chunks(text, chunk_size)
-            log.log("LLM", f"Passe 3 : Vérification NER ({len(chunks2)} chunk(s))...")
-            log.stats["llm_passes"] += 1
-            result_chunks2 = []
-            for i, chunk in enumerate(chunks2, 1):
-                log.log("LLM", f"  Vérif [{i}/{len(chunks2)}]...")
-                result, success = call_ollama_chat(
-                    chunk, SYSTEM_PROMPT_PASS3,
-                    model=model, base_url=ollama_url, timeout=timeout
-                )
-                if success:
-                    log.log("OK", f"  Vérif [{i}/{len(chunks2)}] OK.")
-                else:
-                    log.log("WARN", f"  Vérif [{i}/{len(chunks2)}] erreur — texte précédent conservé.")
-                    log.stats["llm_erreurs"] += 1
-                result_chunks2.append(result)
-                log.stats["llm_chunks_traites"] += 1
-                done_chunks += 1
-                progress = 0.2 + (done_chunks / total_chunks) * 0.65
-                if on_progress:
-                    on_progress(f"Passe 3 vérif — chunk {i}/{len(chunks2)}", progress)
-
+            result_chunks2 = _run_llm_pass(
+                chunks2, SYSTEM_PROMPT_PASS3, "Passe 3 vérif", log, model,
+                ollama_url, timeout, cancel_flag, on_progress,
+                done_ref, total_chunks,
+            )
             text = "\n\n".join(result_chunks2)
 
-        # --- Passe 4 optionnelle : re-vérif stricte ---
-        if passes >= 3:
+        # Passe 4
+        if passes >= 3 and not (cancel_flag and cancel_flag.is_set()):
             chunks3 = split_into_chunks(text, chunk_size)
-            log.log("LLM", f"Passe 4 : Re-vérification stricte ({len(chunks3)} chunk(s))...")
-            log.stats["llm_passes"] += 1
-            result_chunks3 = []
-            for i, chunk in enumerate(chunks3, 1):
-                log.log("LLM", f"  Strict [{i}/{len(chunks3)}]...")
-                result, success = call_ollama_chat(
-                    chunk, SYSTEM_PROMPT_PASS3,
-                    model=model, base_url=ollama_url, timeout=timeout
-                )
-                result_chunks3.append(result)
-                log.stats["llm_chunks_traites"] += 1
-                done_chunks += 1
-                progress = 0.2 + (done_chunks / total_chunks) * 0.65
-                if on_progress:
-                    on_progress(f"Passe 4 strict — chunk {i}/{len(chunks3)}", progress)
+            result_chunks3 = _run_llm_pass(
+                chunks3, SYSTEM_PROMPT_PASS3, "Passe 4 strict", log, model,
+                ollama_url, timeout, cancel_flag, on_progress,
+                done_ref, total_chunks,
+            )
             text = "\n\n".join(result_chunks3)
 
         llm_entity_map = count_llm_tags(text)
-        if llm_entity_map:
-            log.log("LLM", "Tags LLM détectés dans le résultat :")
-            for tag, count in sorted(llm_entity_map.items()):
-                log.log("LLM", f"  {tag} × {count}")
-    else:
+    elif not use_llm:
         log.log("INFO", "Passe LLM ignorée.")
 
-    # ── Vérification finale (regex) ────────────────────────────
-    log.log("VERIF", "Vérification post-anonymisation (regex)...", progress=0.9)
+    # ── Vérification finale ──────────────────────────────────
+    log.log("VERIF", "Vérification post-anonymisation...", progress=0.9)
     warnings = post_check(text)
     log.stats["verif_warnings"] = warnings
     if warnings:
@@ -701,19 +894,19 @@ def run_pipeline(
     log.stats["taille_finale"] = len(text)
     log.stats["duree_totale"] = round(time.time() - log.start_time, 2)
 
-    # ── Construction du mapping ──────────────────────────────
+    # ── Mapping ──────────────────────────────────────────────
     mapping_export = {}
     for key, tag in regex_anon.mapping.items():
         _, original = key.split("::", 1)
         mapping_export[tag] = original
     for tag in llm_entity_map:
         if tag not in mapping_export:
-            mapping_export[tag] = "⟨détecté par LLM — valeur originale non tracée⟩"
+            mapping_export[tag] = "⟨détecté par LLM⟩"
 
-    # ── Rapport ──────────────────────────────────────────────
-    report = log.generate_report(regex_anon, llm_entity_map)
-
-    log.log("DONE", "Anonymisation terminée.", progress=1.0)
+    report = log.generate_report(
+        regex_anon, llm_entity_map, images_folder=images_folder,
+    )
+    log.log("DONE", f"Terminé en {log.elapsed()}.", progress=1.0)
 
     return {
         "text": text,
@@ -721,6 +914,7 @@ def run_pipeline(
         "report": report,
         "warnings": warnings,
         "stats": log.stats,
+        "regex_anon": regex_anon,
     }
 
 
@@ -730,7 +924,7 @@ def run_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Anonymisation hybride v2 (Regex + LLM Ollama /api/chat, multi-passe)",
+        description="Anonymisation hybride (Regex + LLM Ollama, multi-passe)",
         epilog="""
 Exemples :
   python anonymize.py cahier_des_charges.docx
@@ -740,14 +934,14 @@ Exemples :
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("fichier", help="Fichier à anonymiser")
-    parser.add_argument("--model", default="gpt-oss:20b", help="Modèle Ollama (défaut: gpt-oss:20b)")
-    parser.add_argument("--output", "-o", help="Fichier de sortie (défaut: <nom>_anonymise.md)")
-    parser.add_argument("--ollama-url", default="http://localhost:11434", help="URL Ollama")
-    parser.add_argument("--no-llm", action="store_true", help="Regex uniquement")
-    parser.add_argument("--chunk-size", type=int, default=4000, help="Taille max par chunk (défaut: 4000)")
-    parser.add_argument("--passes", type=int, default=2, choices=[1, 2, 3],
-                        help="Nombre de passes LLM : 1=anonymisation, 2=+vérification, 3=+vérification stricte (défaut: 2)")
-    parser.add_argument("--timeout", type=int, default=300, help="Timeout par requête Ollama en secondes (défaut: 300)")
+    parser.add_argument("--model", default="gpt-oss:20b", help="Modèle Ollama")
+    parser.add_argument("--output", "-o", help="Fichier de sortie")
+    parser.add_argument("--ollama-url", default="http://localhost:11434")
+    parser.add_argument("--no-llm", action="store_true",
+                        help="Regex uniquement")
+    parser.add_argument("--chunk-size", type=int, default=4000)
+    parser.add_argument("--passes", type=int, default=2, choices=[1, 2, 3])
+    parser.add_argument("--timeout", type=int, default=300)
 
     args = parser.parse_args()
     filepath = Path(args.fichier)
@@ -760,49 +954,56 @@ Exemples :
     print(f"  ANONYMISATION — {filepath.name}")
     print(f"{'='*60}\n")
 
-    # Lecture
-    text = read_file(filepath)
+    # Read file + extract images
+    text, images = read_file_with_images(filepath)
 
-    # Exécution pipeline
+    images_folder_name = ""
+    if images:
+        images_dir = filepath.with_name(f"{filepath.stem}_images")
+        saved = save_images(images, images_dir)
+        images_folder_name = images_dir.name
+        print(f"  🖼️  {len(images)} image(s) extraite(s) → {images_dir}")
+
     result = run_pipeline(
-        text=text,
-        filename=filepath.name,
-        use_llm=not args.no_llm,
-        model=args.model,
-        ollama_url=args.ollama_url,
-        chunk_size=args.chunk_size,
-        passes=args.passes,
-        timeout=args.timeout,
+        text=text, filename=filepath.name,
+        use_llm=not args.no_llm, model=args.model,
+        ollama_url=args.ollama_url, chunk_size=args.chunk_size,
+        passes=args.passes, timeout=args.timeout,
+        images_count=len(images),
+        images_folder=images_folder_name,
     )
 
-    # Écriture des fichiers
-    output_path = Path(args.output) if args.output else filepath.with_name(f"{filepath.stem}_anonymise.md")
+    output_path = (
+        Path(args.output) if args.output
+        else filepath.with_name(f"{filepath.stem}_anonymise.md")
+    )
     output_path.write_text(result["text"], encoding="utf-8")
 
     mapping_path = filepath.with_name(f"{filepath.stem}_mapping.json")
-    mapping_path.write_text(json.dumps(result["mapping"], indent=2, ensure_ascii=False), encoding="utf-8")
+    mapping_path.write_text(
+        json.dumps(result["mapping"], indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
     report_path = filepath.with_name(f"{filepath.stem}_rapport.md")
     report_path.write_text(result["report"], encoding="utf-8")
 
-    # Résumé final
     s = result["stats"]
     print(f"\n{'='*60}")
     print(f"  RÉSUMÉ")
     print(f"{'='*60}")
     print(f"  📄 Source       : {filepath.name}")
-    print(f"  📏 Taille       : {s['taille_originale']} → {s['taille_finale']} chars")
+    print(f"  📏 Taille       : {s['taille_originale']} → "
+          f"{s['taille_finale']} chars")
     if s["custom_remplacements"]:
-        print(f"  🏷️  Custom       : {s['custom_remplacements']} remplacements")
-    print(f"  🔍 Regex        : {s['regex_remplacements']} remplacements")
-    print(f"  🤖 LLM          : {s['llm_passes']} passes, {s['llm_chunks_traites']} chunks")
-    if s['llm_erreurs']:
-        print(f"  ❌ Erreurs LLM  : {s['llm_erreurs']}")
-    print(f"  ⚠️  Warnings     : {len(result['warnings'])}")
+        print(f"  🏷️  Custom       : {s['custom_remplacements']}")
+    print(f"  🔍 Regex        : {s['regex_remplacements']}")
+    print(f"  🤖 LLM          : {s['llm_passes']} passes, "
+          f"{s['llm_chunks_traites']} chunks")
+    if images:
+        print(f"  🖼️  Images       : {len(images)} → {images_folder_name}/")
     print(f"  ⏱️  Durée        : {s['duree_totale']}s")
     print(f"  ✅ Sortie       : {output_path}")
-    print(f"  📊 Rapport      : {report_path}")
-    print(f"  🔑 Mapping      : {mapping_path}")
     print(f"{'='*60}\n")
 
 

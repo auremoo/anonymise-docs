@@ -44,6 +44,7 @@ You want to use Claude, ChatGPT, or any cloud AI to analyze your documents — b
 | `<name>_anonymise.md` | Anonymized document | Yes — safe to send to cloud AI |
 | `<name>_mapping.json` | Original ↔ tag correspondence table | **No** — keep private, used for de-anonymization |
 | `<name>_rapport.md` | Detailed anonymization report with stats | Optional — useful for audit |
+| `<name>_images/` | Extracted images (IMAGE_1.png, IMAGE_2.jpg...) | **Review first** — check for sensitive content |
 
 ## Installation
 
@@ -179,6 +180,7 @@ python anonymize.py big_file.docx --chunk-size 2000
 | `[PROJET_n]` | Internal project names | LLM |
 | `[LIEU_n]` | Physical addresses / cities | LLM |
 | `[REF_n]` | Contract numbers, client refs | LLM |
+| `[IMAGE_n]` | Image placeholders (docx/pdf) | Extraction |
 
 ## Web interface (Streamlit)
 
@@ -189,14 +191,17 @@ streamlit run app.py
 ```
 
 Features:
+- Bilingual interface (FR/EN toggle)
 - Drag & drop file upload
 - Custom words/names to anonymize (with category selection)
-- Real-time progress bar
+- LLM model selector (auto-detects installed Ollama models)
+- Real-time progress bar with elapsed time
+- Stop button to cancel long-running anonymization
+- Image extraction from docx/pdf (saved as numbered files, downloadable as zip)
 - Before/after preview
-- Download anonymized file, mapping, and report
+- Download anonymized file, mapping, report, and images
 - Ollama connection status indicator
-
-The model is fixed to `gpt-oss:20b`.
+- All controls disabled during processing
 
 ## LLM prompt design notes
 
@@ -260,11 +265,15 @@ streamlit run app.py
 ```
 
 Ouvre une interface dans le navigateur avec :
+- Interface bilingue (FR/EN)
 - Glisser-déposer de fichiers
 - Saisie de mots/noms personnalisés à anonymiser
-- Barre de progression en temps réel
+- Sélection du modèle LLM (détection automatique des modèles Ollama installés)
+- Barre de progression en temps réel avec chronomètre
+- Bouton d'arrêt pour annuler un traitement long
+- Extraction d'images depuis docx/pdf (fichiers numérotés, téléchargeables en zip)
 - Prévisualisation avant/après
-- Téléchargement des résultats
+- Téléchargement des résultats (fichier anonymisé, mapping, rapport, images)
 
 ### Ligne de commande
 
@@ -284,6 +293,7 @@ python anonymize.py notes.md --no-llm -o notes_clean.md
 | `*_anonymise.md` | Document anonymisé | **Oui** — envoyez-le à Claude sans risque |
 | `*_mapping.json` | Table de correspondance tag ↔ valeur originale | **Non** — gardez-le privé |
 | `*_rapport.md` | Rapport détaillé de l'anonymisation | Optionnel |
+| `*_images/` | Images extraites (IMAGE_1.png, IMAGE_2.jpg...) | **À vérifier** — contrôlez le contenu sensible |
 
 ## Workflow typique
 

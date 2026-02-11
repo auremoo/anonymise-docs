@@ -3,31 +3,177 @@ Interface Streamlit pour l'anonymisation de documents.
 Lancement : streamlit run app.py
 """
 
+import io
 import json
+import time
+import zipfile
+import threading
 import streamlit as st
 import pandas as pd
 from pathlib import Path
 
 from anonymize import (
+    read_file_bytes_with_images,
     read_file_bytes,
     run_pipeline,
+    save_images,
     check_ollama,
 )
+
+# =============================================================================
+# TRADUCTIONS
+# =============================================================================
+
+TEXTS = {
+    "page_title": {
+        "FR": "Anonymisation de documents",
+        "EN": "Document Anonymization",
+    },
+    "main_title": {
+        "FR": "Anonymisation de documents",
+        "EN": "Document Anonymization",
+    },
+    "main_caption": {
+        "FR": "Glissez un document, configurez les options, anonymisez.",
+        "EN": "Drop a document, configure options, anonymize.",
+    },
+    "status": {"FR": "Statut", "EN": "Status"},
+    "model_label": {"FR": "Modèle LLM", "EN": "LLM Model"},
+    "model_help": {
+        "FR": "Sélectionnez le modèle Ollama à utiliser",
+        "EN": "Select the Ollama model to use",
+    },
+    "local_notice": {
+        "FR": "Tout le traitement se fait **localement** via Ollama.\n"
+              "Aucune donnée n'est envoyée à un service externe.",
+        "EN": "All processing is done **locally** via Ollama.\n"
+              "No data is sent to any external service.",
+    },
+    "upload_label": {
+        "FR": "Glisser-déposer un fichier",
+        "EN": "Drag and drop a file",
+    },
+    "upload_help": {
+        "FR": "Formats supportés : ",
+        "EN": "Supported formats: ",
+    },
+    "custom_words_title": {
+        "FR": "Mots à anonymiser",
+        "EN": "Words to anonymize",
+    },
+    "custom_words_caption": {
+        "FR": "Ajoutez des mots/noms spécifiques à remplacer en priorité "
+              "(avant regex et LLM).",
+        "EN": "Add specific words/names to replace first "
+              "(before regex and LLM).",
+    },
+    "col_word": {"FR": "Mot / Nom", "EN": "Word / Name"},
+    "col_category": {"FR": "Catégorie", "EN": "Category"},
+    "col_word_help": {
+        "FR": "Le mot ou nom à anonymiser (ex: Jean Dupont, Acme Corp)",
+        "EN": "The word or name to anonymize (e.g. John Doe, Acme Corp)",
+    },
+    "col_category_help": {
+        "FR": "Type d'entité",
+        "EN": "Entity type",
+    },
+    "options_title": {"FR": "Options", "EN": "Options"},
+    "passes_label": {"FR": "Passes LLM", "EN": "LLM Passes"},
+    "passes_help": {
+        "FR": "1 = anonymisation seule, 2 = + vérification, "
+              "3 = + re-vérification stricte",
+        "EN": "1 = anonymize only, 2 = + verification, "
+              "3 = + strict re-verification",
+    },
+    "regex_only": {
+        "FR": "Regex uniquement (sans LLM)",
+        "EN": "Regex only (no LLM)",
+    },
+    "regex_only_help": {
+        "FR": "Plus rapide mais moins précis — pas de détection de "
+              "noms/entreprises",
+        "EN": "Faster but less accurate — no name/company detection",
+    },
+    "extract_images": {
+        "FR": "Extraire les images",
+        "EN": "Extract images",
+    },
+    "extract_images_help": {
+        "FR": "Extraire les images du document (docx/pdf) dans un dossier "
+              "séparé avec placeholders [IMAGE_N]",
+        "EN": "Extract images from document (docx/pdf) into a separate "
+              "folder with [IMAGE_N] placeholders",
+    },
+    "ollama_warning": {
+        "FR": "Ollama n'est pas connecté. Activez 'Regex uniquement' ou "
+              "lancez `ollama serve`.",
+        "EN": "Ollama is not connected. Enable 'Regex only' or "
+              "run `ollama serve`.",
+    },
+    "btn_anonymize": {"FR": "Anonymiser", "EN": "Anonymize"},
+    "btn_stop": {"FR": "Arrêter", "EN": "Stop"},
+    "starting": {"FR": "Démarrage...", "EN": "Starting..."},
+    "running": {
+        "FR": "Anonymisation en cours...",
+        "EN": "Anonymization in progress...",
+    },
+    "done": {"FR": "Terminé !", "EN": "Done!"},
+    "cancelled": {"FR": "Annulé.", "EN": "Cancelled."},
+    "read_error": {
+        "FR": "Erreur de lecture : ",
+        "EN": "Read error: ",
+    },
+    "results_title": {"FR": "Résultats", "EN": "Results"},
+    "metric_size": {"FR": "Taille", "EN": "Size"},
+    "metric_custom": {"FR": "Custom", "EN": "Custom"},
+    "metric_regex": {"FR": "Regex", "EN": "Regex"},
+    "metric_llm": {"FR": "Passes LLM", "EN": "LLM Passes"},
+    "metric_time": {"FR": "Durée", "EN": "Duration"},
+    "metric_images": {"FR": "Images", "EN": "Images"},
+    "preview_title": {"FR": "Prévisualisation", "EN": "Preview"},
+    "tab_after": {"FR": "Après (anonymisé)", "EN": "After (anonymized)"},
+    "tab_before": {"FR": "Avant (original)", "EN": "Before (original)"},
+    "tab_report": {"FR": "Rapport", "EN": "Report"},
+    "downloads_title": {"FR": "Téléchargements", "EN": "Downloads"},
+    "dl_anon": {
+        "FR": "Fichier anonymisé (.md)",
+        "EN": "Anonymized file (.md)",
+    },
+    "dl_mapping": {"FR": "Mapping (.json)", "EN": "Mapping (.json)"},
+    "dl_report": {"FR": "Rapport (.md)", "EN": "Report (.md)"},
+    "dl_images": {"FR": "Images (.zip)", "EN": "Images (.zip)"},
+    "output_saved": {
+        "FR": "Fichiers sauvegardés dans",
+        "EN": "Files saved to",
+    },
+    "llm_no_change": {
+        "FR": "chunk(s) retourné(s) identiques par le LLM — "
+              "le modèle ne semble pas anonymiser. "
+              "Essayez un modèle plus grand ou vérifiez qu'il est adapté au NER.",
+        "EN": "chunk(s) returned identical by LLM — "
+              "the model does not seem to anonymize. "
+              "Try a larger model or check it supports NER.",
+    },
+}
+
+
+def t(key: str) -> str:
+    """Get translated string for current language."""
+    lang = st.session_state.get("lang", "FR")
+    entry = TEXTS.get(key, {})
+    return entry.get(lang, entry.get("FR", key))
+
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-MODEL = "gpt-oss:20b"
 OLLAMA_URL = "http://localhost:11434"
+DEFAULT_MODEL = "gpt-oss:20b"
+OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 CATEGORIES = [
-    "PERSONNE",
-    "ENTREPRISE",
-    "SITE",
-    "PROJET",
-    "LIEU",
-    "REF",
+    "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "LIEU", "REF",
 ]
 
 SUPPORTED_EXTENSIONS = [
@@ -40,192 +186,392 @@ SUPPORTED_EXTENSIONS = [
 # =============================================================================
 
 st.set_page_config(
-    page_title="Anonymisation de documents",
-    page_icon="🔒",
+    page_title="Anonymize Docs",
+    page_icon="\U0001f512",
     layout="wide",
 )
-
 
 # =============================================================================
 # STATE
 # =============================================================================
 
-if "result" not in st.session_state:
-    st.session_state.result = None
+# Shared dict for background thread communication.
+# The thread writes to this dict directly (not via st.session_state)
+# which avoids Streamlit's "missing ScriptRunContext" warnings.
+if "pipe" not in st.session_state:
+    st.session_state.pipe = {
+        "running": False,
+        "result": None,
+        "error": None,
+        "msg": "",
+        "pct": 0.0,
+    }
+
 if "original_text" not in st.session_state:
     st.session_state.original_text = None
-if "running" not in st.session_state:
-    st.session_state.running = False
+if "images_data" not in st.session_state:
+    st.session_state.images_data = None
+if "cancel_flag" not in st.session_state:
+    st.session_state.cancel_flag = threading.Event()
+if "lang" not in st.session_state:
+    st.session_state.lang = "FR"
+if "filename_stem" not in st.session_state:
+    st.session_state.filename_stem = ""
 
+# Convenience reference (same dict object across reruns)
+pipe = st.session_state.pipe
 
 # =============================================================================
-# SIDEBAR — Statut Ollama
+# SIDEBAR
 # =============================================================================
 
 with st.sidebar:
-    st.header("Statut")
-    connected, msg, models = check_ollama(OLLAMA_URL, MODEL)
-    if connected and MODEL in " ".join(models):
-        st.success(f"🟢 {msg}")
+    # Language toggle
+    lang = st.radio(
+        "\U0001f310",
+        ["FR", "EN"],
+        index=0 if st.session_state.lang == "FR" else 1,
+        horizontal=True,
+        key="lang_radio",
+    )
+    st.session_state.lang = lang
+
+    st.header(t("status"))
+
+    # Check Ollama + get available models
+    connected, msg, available_models = check_ollama(OLLAMA_URL, DEFAULT_MODEL)
+
+    if connected and DEFAULT_MODEL in " ".join(available_models):
+        st.success(f"\U0001f7e2 {msg}")
     elif connected:
-        st.warning(f"🟡 {msg}")
-        if models:
-            st.caption(f"Modèles disponibles : {', '.join(models)}")
+        st.warning(f"\U0001f7e1 {msg}")
     else:
-        st.error(f"🔴 {msg}")
+        st.error(f"\U0001f534 {msg}")
+
+    # Model selector
+    if available_models:
+        default_idx = 0
+        for i, m in enumerate(available_models):
+            if DEFAULT_MODEL in m:
+                default_idx = i
+                break
+        selected_model = st.selectbox(
+            t("model_label"),
+            options=available_models,
+            index=default_idx,
+            help=t("model_help"),
+        )
+    else:
+        selected_model = DEFAULT_MODEL
+        st.caption(f"Model: {DEFAULT_MODEL}")
 
     st.divider()
-    st.caption("Tout le traitement se fait **localement** via Ollama.")
-    st.caption("Aucune donnée n'est envoyée à un service externe.")
-
+    st.caption(t("local_notice"))
 
 # =============================================================================
 # MAIN
 # =============================================================================
 
-st.title("🔒 Anonymisation de documents")
-st.caption("Glissez un document, configurez les options, anonymisez.")
+st.title(f"\U0001f512 {t('main_title')}")
+st.caption(t("main_caption"))
 
 # ── Upload ───────────────────────────────────────────────────
 
 uploaded_file = st.file_uploader(
-    "Glisser-déposer un fichier",
+    t("upload_label"),
     type=SUPPORTED_EXTENSIONS,
-    help="Formats supportés : " + ", ".join(f".{e}" for e in SUPPORTED_EXTENSIONS),
+    help=t("upload_help") + ", ".join(f".{e}" for e in SUPPORTED_EXTENSIONS),
+    disabled=pipe["running"],
 )
 
-# ── Mots personnalisés ───────────────────────────────────────
+# ── Custom words ─────────────────────────────────────────────
 
-st.subheader("Mots à anonymiser")
-st.caption("Ajoutez des mots/noms spécifiques à remplacer en priorité (avant regex et LLM).")
+st.subheader(t("custom_words_title"))
+st.caption(t("custom_words_caption"))
 
 if "custom_words_df" not in st.session_state:
     st.session_state.custom_words_df = pd.DataFrame(
-        [{"Mot / Nom": "", "Catégorie": "PERSONNE"}],
-        columns=["Mot / Nom", "Catégorie"],
+        [{t("col_word"): "", t("col_category"): "PERSONNE"}],
+        columns=[t("col_word"), t("col_category")],
     )
 
+# Rebuild column names if language changed
+col_word = t("col_word")
+col_cat = t("col_category")
+
+df = st.session_state.custom_words_df
+if df.columns.tolist() != [col_word, col_cat]:
+    df.columns = [col_word, col_cat]
+
 edited_df = st.data_editor(
-    st.session_state.custom_words_df,
+    df,
     column_config={
-        "Mot / Nom": st.column_config.TextColumn(
-            "Mot / Nom",
-            help="Le mot ou nom à anonymiser (ex: Jean Dupont, Acme Corp)",
-            width="large",
+        col_word: st.column_config.TextColumn(
+            col_word, help=t("col_word_help"), width="large",
         ),
-        "Catégorie": st.column_config.SelectboxColumn(
-            "Catégorie",
-            help="Type d'entité",
-            options=CATEGORIES,
-            width="medium",
+        col_cat: st.column_config.SelectboxColumn(
+            col_cat, help=t("col_category_help"),
+            options=CATEGORIES, width="medium",
         ),
     },
     num_rows="dynamic",
-    use_container_width=True,
+    width="stretch",
     key="custom_editor",
+    disabled=pipe["running"],
 )
 
 # ── Options ──────────────────────────────────────────────────
 
-st.subheader("Options")
+st.subheader(t("options_title"))
 
-col1, col2 = st.columns(2)
+col1, col2, col3 = st.columns(3)
 with col1:
     passes = st.radio(
-        "Passes LLM",
+        t("passes_label"),
         options=[1, 2, 3],
         index=1,
         horizontal=True,
-        help="1 = anonymisation seule, 2 = + vérification, 3 = + re-vérification stricte",
+        help=t("passes_help"),
+        disabled=pipe["running"],
     )
 with col2:
     no_llm = st.checkbox(
-        "Regex uniquement (sans LLM)",
+        t("regex_only"),
         value=False,
-        help="Plus rapide mais moins précis — pas de détection de noms/entreprises",
+        help=t("regex_only_help"),
+        disabled=pipe["running"],
+    )
+with col3:
+    extract_imgs = st.checkbox(
+        t("extract_images"),
+        value=True,
+        help=t("extract_images_help"),
+        disabled=pipe["running"],
     )
 
-# ── Bouton Anonymiser ────────────────────────────────────────
+# ── Buttons ──────────────────────────────────────────────────
 
 st.divider()
 
-can_run = uploaded_file is not None
+can_run = uploaded_file is not None and not pipe["running"]
 if not connected and not no_llm:
-    st.warning("Ollama n'est pas connecté. Activez 'Regex uniquement' ou lancez `ollama serve`.")
-    can_run = can_run and False
+    st.warning(t("ollama_warning"))
+    can_run = False
 
-if st.button("🚀 Anonymiser", type="primary", disabled=not can_run, use_container_width=True):
-    # Préparer les mots custom
+btn_col1, btn_col2 = st.columns([3, 1])
+
+with btn_col1:
+    run_clicked = st.button(
+        f"\U0001f680 {t('btn_anonymize')}",
+        type="primary",
+        disabled=not can_run,
+        width="stretch",
+    )
+
+with btn_col2:
+    stop_clicked = st.button(
+        f"\U0001f6d1 {t('btn_stop')}",
+        disabled=not pipe["running"],
+        width="stretch",
+    )
+
+if stop_clicked:
+    st.session_state.cancel_flag.set()
+
+# ── Start pipeline (background thread) ──────────────────────
+
+if run_clicked:
+    # Reset shared state
+    pipe["running"] = True
+    pipe["result"] = None
+    pipe["error"] = None
+    pipe["msg"] = t("starting")
+    pipe["pct"] = 0.0
+
+    st.session_state.images_data = None
+    st.session_state.cancel_flag = threading.Event()
+
+    # Prepare custom words
     custom_words = {}
     for _, row in edited_df.iterrows():
-        word = str(row["Mot / Nom"]).strip()
-        cat = str(row["Catégorie"]).strip()
+        word = str(row[col_word]).strip()
+        cat = str(row[col_cat]).strip()
         if word:
             custom_words[word] = cat
 
-    # Lire le fichier
+    # Read file + extract images
     try:
         file_bytes = uploaded_file.getvalue()
-        text = read_file_bytes(file_bytes, uploaded_file.name)
+        if extract_imgs:
+            text, images = read_file_bytes_with_images(
+                file_bytes, uploaded_file.name,
+            )
+        else:
+            text = read_file_bytes(file_bytes, uploaded_file.name)
+            images = []
     except Exception as e:
-        st.error(f"Erreur de lecture : {e}")
+        st.error(f"{t('read_error')}{e}")
+        pipe["running"] = False
         st.stop()
 
     st.session_state.original_text = text
+    st.session_state.images_data = images
+    filename_stem = Path(uploaded_file.name).stem
+    st.session_state.filename_stem = filename_stem
+    images_folder = f"{filename_stem}_images" if images else ""
 
-    # Barre de progression
-    progress_bar = st.progress(0, text="Démarrage...")
-    status_text = st.empty()
+    # Capture references for the thread (no st.session_state access)
+    _pipe = pipe
+    _cancel_flag = st.session_state.cancel_flag
+    _text = text
+    _filename = uploaded_file.name
+    _custom_words = custom_words if custom_words else None
+    _use_llm = not no_llm
+    _model = selected_model
+    _passes = passes
+    _images = images
+    _images_folder = images_folder
+    _filename_stem = filename_stem
 
     def on_progress(message: str, percent: float):
-        progress_bar.progress(min(percent, 1.0), text=message)
+        _pipe["msg"] = message
+        _pipe["pct"] = min(percent, 1.0)
 
-    # Exécution
-    with st.spinner("Anonymisation en cours..."):
-        result = run_pipeline(
-            text=text,
-            filename=uploaded_file.name,
-            custom_words=custom_words if custom_words else None,
-            use_llm=not no_llm,
-            model=MODEL,
-            ollama_url=OLLAMA_URL,
-            passes=passes,
-            on_progress=on_progress,
-        )
+    def run_in_thread():
+        try:
+            result = run_pipeline(
+                text=_text,
+                filename=_filename,
+                custom_words=_custom_words,
+                use_llm=_use_llm,
+                model=_model,
+                ollama_url=OLLAMA_URL,
+                passes=_passes,
+                on_progress=on_progress,
+                cancel_flag=_cancel_flag,
+                images_count=len(_images),
+                images_folder=_images_folder,
+            )
+            _pipe["result"] = result
 
-    progress_bar.progress(1.0, text="Terminé !")
-    st.session_state.result = result
+            # Auto-save to output/ folder
+            OUTPUT_DIR.mkdir(exist_ok=True)
+            (OUTPUT_DIR / f"{_filename_stem}_anonymise.md").write_text(
+                result["text"], encoding="utf-8",
+            )
+            (OUTPUT_DIR / f"{_filename_stem}_mapping.json").write_text(
+                json.dumps(
+                    result["mapping"], indent=2, ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            (OUTPUT_DIR / f"{_filename_stem}_rapport.md").write_text(
+                result["report"], encoding="utf-8",
+            )
+            if _images:
+                save_images(
+                    _images, OUTPUT_DIR / f"{_filename_stem}_images",
+                )
+        except Exception as e:
+            _pipe["error"] = str(e)
+        finally:
+            _pipe["running"] = False
 
-# ── Résultats ────────────────────────────────────────────────
+    thread = threading.Thread(target=run_in_thread, daemon=True)
+    thread.start()
+    st.rerun()
 
-if st.session_state.result is not None:
-    result = st.session_state.result
+# ── Polling while pipeline runs ──────────────────────────────
+
+if pipe["running"]:
+    progress_container = st.empty()
+    while pipe["running"]:
+        msg = pipe["msg"] or t("starting")
+        pct = pipe["pct"]
+        progress_container.progress(min(max(pct, 0.0), 1.0), text=msg)
+        time.sleep(0.5)
+    # Pipeline finished — brief display of final state
+    if st.session_state.cancel_flag.is_set():
+        progress_container.progress(1.0, text=t("cancelled"))
+    else:
+        progress_container.progress(1.0, text=t("done"))
+    time.sleep(1)
+    st.rerun()  # One final rerun to show results with enabled controls
+
+# ── Pipeline error ───────────────────────────────────────────
+
+if pipe["error"]:
+    st.error(f"Pipeline error: {pipe['error']}")
+    pipe["error"] = None
+
+# ── Results ──────────────────────────────────────────────────
+
+if pipe["result"] is not None:
+    result = pipe["result"]
     stats = result["stats"]
+    images = st.session_state.images_data or []
 
     st.divider()
+    st.subheader(t("results_title"))
 
-    # Métriques
-    st.subheader("Résultats")
+    # Output saved notification
+    filename_stem = st.session_state.filename_stem
+    saved_files = (
+        f"`output/{filename_stem}_anonymise.md`, "
+        f"`output/{filename_stem}_mapping.json`, "
+        f"`output/{filename_stem}_rapport.md`"
+    )
+    if images:
+        saved_files += f", `output/{filename_stem}_images/`"
+    st.success(f"{t('output_saved')} {saved_files}")
 
-    col1, col2, col3, col4, col5 = st.columns(5)
-    col1.metric("Taille", f"{stats['taille_originale']} → {stats['taille_finale']}")
-    col2.metric("Custom", stats["custom_remplacements"])
-    col3.metric("Regex", stats["regex_remplacements"])
-    col4.metric("Passes LLM", f"{stats['llm_passes']} ({stats['llm_chunks_traites']} chunks)")
-    col5.metric("Durée", f"{stats['duree_totale']}s")
+    # Metrics
+    cols = st.columns(6)
+    cols[0].metric(
+        t("metric_size"),
+        f"{stats['taille_originale']} \u2192 {stats['taille_finale']}",
+    )
+    cols[1].metric(t("metric_custom"), stats["custom_remplacements"])
+    cols[2].metric(t("metric_regex"), stats["regex_remplacements"])
+    cols[3].metric(
+        t("metric_llm"),
+        f"{stats['llm_passes']} ({stats['llm_chunks_traites']} chunks)",
+    )
+    cols[4].metric(t("metric_time"), f"{stats['duree_totale']}s")
+    cols[5].metric(t("metric_images"), stats["images_trouvees"])
+
+    # LLM error warnings
+    if stats.get("llm_erreurs", 0) > 0:
+        st.error(
+            f"LLM: {stats['llm_erreurs']} erreur(s) — "
+            "certains chunks n'ont pas été traités par le LLM. "
+            "Vérifiez qu'Ollama est lancé et que le modèle répond."
+        )
+
+    if stats.get("llm_no_change", 0) > 0:
+        st.warning(
+            f"LLM: {stats['llm_no_change']} {t('llm_no_change')}"
+        )
 
     if result["warnings"]:
         for w in result["warnings"]:
             st.warning(w)
 
-    # Prévisualisation avant/après
-    st.subheader("Prévisualisation")
+    if stats.get("annule"):
+        st.warning(t("cancelled"))
 
-    tab_after, tab_before, tab_report = st.tabs(["📄 Après (anonymisé)", "📝 Avant (original)", "📊 Rapport"])
+    # Preview tabs
+    st.subheader(t("preview_title"))
+
+    tab_after, tab_before, tab_report = st.tabs([
+        f"\U0001f4c4 {t('tab_after')}",
+        f"\U0001f4dd {t('tab_before')}",
+        f"\U0001f4ca {t('tab_report')}",
+    ])
 
     with tab_after:
         st.text_area(
-            "Texte anonymisé",
+            t("tab_after"),
             value=result["text"],
             height=400,
             label_visibility="collapsed",
@@ -233,7 +579,7 @@ if st.session_state.result is not None:
 
     with tab_before:
         st.text_area(
-            "Texte original",
+            t("tab_before"),
             value=st.session_state.original_text or "",
             height=400,
             disabled=True,
@@ -243,36 +589,53 @@ if st.session_state.result is not None:
     with tab_report:
         st.markdown(result["report"])
 
-    # Téléchargements
-    st.subheader("Téléchargements")
+    # Downloads
+    st.subheader(t("downloads_title"))
 
-    col1, col2, col3 = st.columns(3)
+    dl_cols = st.columns(4 if images else 3)
 
-    filename_stem = Path(uploaded_file.name).stem if uploaded_file else "document"
-
-    with col1:
+    with dl_cols[0]:
         st.download_button(
-            "⬇️ Fichier anonymisé (.md)",
+            f"\u2b07\ufe0f {t('dl_anon')}",
             data=result["text"],
             file_name=f"{filename_stem}_anonymise.md",
             mime="text/markdown",
-            use_container_width=True,
+            width="stretch",
         )
 
-    with col2:
+    with dl_cols[1]:
         st.download_button(
-            "⬇️ Mapping (.json)",
-            data=json.dumps(result["mapping"], indent=2, ensure_ascii=False),
+            f"\u2b07\ufe0f {t('dl_mapping')}",
+            data=json.dumps(
+                result["mapping"], indent=2, ensure_ascii=False,
+            ),
             file_name=f"{filename_stem}_mapping.json",
             mime="application/json",
-            use_container_width=True,
+            width="stretch",
         )
 
-    with col3:
+    with dl_cols[2]:
         st.download_button(
-            "⬇️ Rapport (.md)",
+            f"\u2b07\ufe0f {t('dl_report')}",
             data=result["report"],
             file_name=f"{filename_stem}_rapport.md",
             mime="text/markdown",
-            use_container_width=True,
+            width="stretch",
         )
+
+    if images:
+        # Create a zip of all images for download
+        zip_buffer = io.BytesIO()
+        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+            for i, (img_data, ext) in enumerate(images, 1):
+                zf.writestr(f"IMAGE_{i}.{ext}", img_data)
+        zip_buffer.seek(0)
+
+        with dl_cols[3]:
+            st.download_button(
+                f"\u2b07\ufe0f {t('dl_images')}",
+                data=zip_buffer.getvalue(),
+                file_name=f"{filename_stem}_images.zip",
+                mime="application/zip",
+                width="stretch",
+            )

@@ -1,7 +1,9 @@
 # Fichiers générés par l'anonymisation (contiennent des données sensibles)
+output/
 *_mapping.json
 *_anonymise.md
 *_rapport.md
+*_images/
 
 # Documents source (ne doivent pas être commités)
 *.docx
