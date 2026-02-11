@@ -8,22 +8,49 @@ Pipeline d'anonymisation hybride (Regex + LLM local Ollama) pour nettoyer des do
 
 ## Architecture
 
-Un seul script Python `anonymize.py` avec une pipeline séquentielle :
+Deux points d'entrée : CLI (`anonymize.py`) et Web (`app.py` Streamlit).
 
 ```
-Fichier source → Lecture → Passe 1 (Regex) → Passe 2 (LLM NER) → Passe 3 (LLM vérif) → Sortie
+                 ┌─────────────┐     ┌────────────┐
+                 │ CLI (main)  │     │ Streamlit  │
+                 │ anonymize.py│     │ app.py     │
+                 └──────┬──────┘     └─────┬──────┘
+                        │                  │
+                        ▼                  ▼
+Fichier source → read_file()    read_file_bytes()
+                        │                  │
+                        └────────┬─────────┘
+                                 ▼
+                          run_pipeline()
+                    Passe 0 (Custom) → Passe 1 (Regex) → Passe 2 (LLM) → Passe 3 (Vérif)
+                                 │
+                                 ▼
+                    {text, mapping, report, stats}
 ```
 
-### Composants internes
+### Composants internes (`anonymize.py`)
 
 | Classe/Fonction | Rôle |
 |----------------|------|
+| `run_pipeline()` | Pipeline principal — appelable depuis CLI ou UI, retourne dict |
+| `apply_custom_words()` | Passe 0 — remplacement exact de mots saisis par l'utilisateur |
 | `RegexAnonymizer` | Passe 1 — patterns structurés (IP, email, dates, FQDN, chemins, téléphones) |
 | `call_ollama_chat()` | Appel Ollama via `/api/chat` avec system prompt |
 | `split_into_chunks()` | Découpage intelligent (paragraphes > lignes) |
 | `post_check()` | Vérification finale regex pour patterns résiduels |
-| `Logger` | Traçabilité complète + génération du rapport |
-| `read_file()` | Lecture multi-format (md, txt, docx, pdf, csv, json, xml, yaml...) |
+| `Logger` | Traçabilité complète + callback UI + génération du rapport |
+| `read_file()` / `read_file_bytes()` | Lecture multi-format (fichier disque / bytes mémoire) |
+| `check_ollama()` | Vérifie connexion Ollama et disponibilité modèle |
+
+### Interface Streamlit (`app.py`)
+
+| Composant | Rôle |
+|-----------|------|
+| File uploader | Drag & drop de documents |
+| Data editor | Tableau dynamique de mots custom à anonymiser |
+| Progress bar | Callback `on_progress` depuis `run_pipeline()` |
+| Tabs avant/après | Prévisualisation du résultat |
+| Download buttons | Téléchargement fichier anonymisé, mapping, rapport |
 
 ### Fichiers de sortie
 
@@ -36,7 +63,8 @@ Fichier source → Lecture → Passe 1 (Regex) → Passe 2 (LLM NER) → Passe 3
 - **Python 3.10+**
 - **Ollama** — runtime LLM local (`http://localhost:11434`)
 - **Modèle par défaut** : `gpt-oss:20b`
-- **Dépendances** : `requests`, `python-docx`, `pymupdf`
+- **Streamlit** — interface web locale
+- **Dépendances** : `requests`, `python-docx`, `pymupdf`, `streamlit`, `pandas`
 
 ## Conventions
 
@@ -73,20 +101,23 @@ Les prompts système sont dans les constantes `SYSTEM_PROMPT_PASS2` et `SYSTEM_P
 ## Commandes fréquentes
 
 ```bash
-# Usage standard
+# Interface web
+streamlit run app.py
+
+# CLI — usage standard
 python anonymize.py document.docx
 
-# Regex seul (rapide, sans LLM)
+# CLI — regex seul (rapide, sans LLM)
 python anonymize.py document.docx --no-llm
 
-# 3 passes LLM (max qualité)
+# CLI — 3 passes LLM (max qualité)
 python anonymize.py document.docx --passes 3
-
-# Modèle plus gros
-python anonymize.py document.docx --model gpt-oss:120b
 
 # Vérifier qu'Ollama tourne
 curl http://localhost:11434/api/tags
+
+# Installer les dépendances
+pip install -r requirements.txt
 ```
 
 ## Fichiers à ne jamais commiter

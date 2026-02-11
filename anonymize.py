@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 Pipeline d'anonymisation hybride v2 : Regex + LLM local (Ollama /api/chat)
-Usage : python anonymize.py <fichier> [--model gpt-oss:20b] [--output fichier_sortie.md]
+Usage CLI  : python anonymize.py <fichier> [--output fichier_sortie.md]
+Usage Web  : streamlit run app.py
 
 Dépendances :
   pip install requests python-docx pymupdf
@@ -15,6 +16,7 @@ import argparse
 import datetime
 from pathlib import Path
 from collections import defaultdict
+from typing import Callable
 
 try:
     import requests
@@ -42,13 +44,15 @@ except ImportError:
 class Logger:
     """Collecte tous les événements pour le rapport final."""
 
-    def __init__(self):
+    def __init__(self, on_progress: Callable[[str, float], None] | None = None):
         self.entries = []
         self.start_time = time.time()
+        self.on_progress = on_progress
         self.stats = {
             "fichier_source": "",
             "taille_originale": 0,
             "taille_finale": 0,
+            "custom_remplacements": 0,
             "regex_remplacements": 0,
             "llm_passes": 0,
             "llm_chunks_traites": 0,
@@ -57,15 +61,18 @@ class Logger:
             "duree_totale": 0,
         }
 
-    def log(self, level: str, message: str):
+    def log(self, level: str, message: str, progress: float | None = None):
         timestamp = time.time() - self.start_time
         entry = {"t": round(timestamp, 2), "level": level, "msg": message}
         self.entries.append(entry)
         # Affichage console
-        icons = {"INFO": "📄", "REGEX": "🔍", "LLM": "🤖", "VERIF": "🔎",
-                 "OK": "✅", "WARN": "⚠️", "ERROR": "❌", "DONE": "✅"}
+        icons = {"INFO": "📄", "REGEX": "🔍", "CUSTOM": "🏷️", "LLM": "🤖",
+                 "VERIF": "🔎", "OK": "✅", "WARN": "⚠️", "ERROR": "❌", "DONE": "✅"}
         icon = icons.get(level, "•")
         print(f"  {icon} [{timestamp:6.1f}s] {message}")
+        # Callback pour l'UI
+        if self.on_progress and progress is not None:
+            self.on_progress(message, progress)
 
     def generate_report(self, regex_anon, llm_entity_map) -> str:
         """Génère le rapport Markdown complet."""
@@ -83,13 +90,21 @@ class Logger:
             "",
             "---",
             "",
-            "## Passe 1 — Regex (patterns structurés)",
-            "",
-            f"**{self.stats['regex_remplacements']} remplacement(s)**",
-            "",
         ]
 
+        # Table mots custom
+        if self.stats["custom_remplacements"] > 0:
+            lines.append("## Passe 0 — Mots personnalisés")
+            lines.append("")
+            lines.append(f"**{self.stats['custom_remplacements']} remplacement(s)**")
+            lines.append("")
+
         # Table regex
+        lines.append("## Passe 1 — Regex (patterns structurés)")
+        lines.append("")
+        lines.append(f"**{self.stats['regex_remplacements']} remplacement(s)**")
+        lines.append("")
+
         if regex_anon.mapping:
             lines.append("| Tag | Catégorie | Valeur originale |")
             lines.append("|-----|-----------|-----------------|")
@@ -136,6 +151,31 @@ class Logger:
         lines.append("```")
 
         return "\n".join(lines)
+
+
+# =============================================================================
+# PASSE 0 : Mots personnalisés
+# =============================================================================
+
+def apply_custom_words(
+    text: str,
+    custom_words: dict[str, str],
+    regex_anon: "RegexAnonymizer",
+) -> tuple[str, int]:
+    """
+    Remplace les mots custom avant la passe regex.
+    custom_words = {"Jean Dupont": "PERSONNE", "Acme Corp": "ENTREPRISE", ...}
+    Retourne (texte_modifié, nombre_de_remplacements).
+    """
+    count = 0
+    # Trier par longueur décroissante pour éviter les remplacements partiels
+    for word, category in sorted(custom_words.items(), key=lambda x: -len(x[0])):
+        if not word.strip():
+            continue
+        tag = regex_anon._get_tag(category.upper(), word)
+        text, n = re.subn(re.escape(word), tag, text, flags=re.IGNORECASE)
+        count += n
+    return text, count
 
 
 # =============================================================================
@@ -350,6 +390,33 @@ def read_file(filepath: Path) -> str:
             print(f"❌ Format non supporté : {suffix}", file=sys.stderr); sys.exit(1)
 
 
+def read_file_bytes(data: bytes, filename: str) -> str:
+    """Lit un fichier depuis des bytes en mémoire (pour Streamlit file_uploader)."""
+    suffix = Path(filename).suffix.lower()
+    if suffix in (".md", ".txt", ".csv", ".log", ".conf", ".ini", ".yaml", ".yml", ".json", ".xml"):
+        return data.decode("utf-8")
+    elif suffix == ".docx":
+        if not HAS_DOCX:
+            raise ImportError("python-docx requis : pip install python-docx")
+        import io
+        doc = Document(io.BytesIO(data))
+        parts = [p.text for p in doc.paragraphs]
+        for table in doc.tables:
+            for row in table.rows:
+                for cell in row.cells:
+                    parts.append(cell.text)
+        return "\n".join(parts)
+    elif suffix == ".pdf":
+        if not HAS_PDF:
+            raise ImportError("pymupdf requis : pip install pymupdf")
+        doc = fitz.open(stream=data, filetype="pdf")
+        text = "\n".join(page.get_text() for page in doc)
+        doc.close()
+        return text
+    else:
+        return data.decode("utf-8")
+
+
 # =============================================================================
 # DÉCOUPAGE
 # =============================================================================
@@ -443,7 +510,222 @@ def count_llm_tags(text: str) -> dict[str, int]:
 
 
 # =============================================================================
-# MAIN
+# UTILITAIRES (pour l'UI)
+# =============================================================================
+
+def check_ollama(base_url: str = "http://localhost:11434",
+                 model: str = "gpt-oss:20b") -> tuple[bool, str, list[str]]:
+    """
+    Vérifie la connexion Ollama et la disponibilité du modèle.
+    Retourne (connecté, message, liste_modèles).
+    """
+    if not HAS_REQUESTS:
+        return False, "Module 'requests' non installé", []
+    try:
+        r = requests.get(f"{base_url}/api/tags", timeout=5)
+        r.raise_for_status()
+        models = [m["name"] for m in r.json().get("models", [])]
+        if any(model in m for m in models):
+            return True, f"Ollama connecté — {model} prêt", models
+        else:
+            return True, f"Ollama connecté — {model} NON trouvé", models
+    except requests.exceptions.ConnectionError:
+        return False, "Ollama non joignable — lance 'ollama serve'", []
+    except Exception as e:
+        return False, f"Erreur Ollama : {e}", []
+
+
+# =============================================================================
+# PIPELINE PRINCIPAL (appelable depuis CLI ou UI)
+# =============================================================================
+
+def run_pipeline(
+    text: str,
+    filename: str = "document",
+    custom_words: dict[str, str] | None = None,
+    use_llm: bool = True,
+    model: str = "gpt-oss:20b",
+    ollama_url: str = "http://localhost:11434",
+    chunk_size: int = 4000,
+    passes: int = 2,
+    timeout: int = 300,
+    on_progress: Callable[[str, float], None] | None = None,
+) -> dict:
+    """
+    Exécute la pipeline d'anonymisation complète.
+
+    Retourne un dict avec :
+      - text: texte anonymisé
+      - mapping: dict tag → valeur originale
+      - report: rapport markdown
+      - warnings: liste de warnings
+      - stats: statistiques d'exécution
+    """
+    log = Logger(on_progress=on_progress)
+    log.stats["fichier_source"] = filename
+    log.stats["taille_originale"] = len(text)
+
+    log.log("INFO", f"Début anonymisation de {filename} ({len(text)} caractères)", progress=0.0)
+
+    # ── Passe 0 : Mots personnalisés ──────────────────────────
+    regex_anon = RegexAnonymizer()
+
+    if custom_words:
+        log.log("CUSTOM", f"Passe 0 : {len(custom_words)} mot(s) personnalisé(s)...", progress=0.05)
+        text, custom_count = apply_custom_words(text, custom_words, regex_anon)
+        log.stats["custom_remplacements"] = custom_count
+        log.log("CUSTOM", f"{custom_count} remplacement(s) de mots personnalisés.")
+        for word, cat in custom_words.items():
+            if word.strip():
+                log.log("CUSTOM", f"  [{cat.upper()}] ← {word}")
+
+    # ── Passe 1 : Regex ────────────────────────────────────────
+    log.log("REGEX", "Passe 1 : Anonymisation regex (IP, email, date, tél, FQDN, chemins)...", progress=0.1)
+    text = regex_anon.anonymize(text)
+    log.stats["regex_remplacements"] = len(regex_anon.mapping) - (len(custom_words) if custom_words else 0)
+    log.log("REGEX", f"{log.stats['regex_remplacements']} patterns regex remplacés.")
+
+    for key, tag in regex_anon.mapping.items():
+        cat, val = key.split("::", 1)
+        log.log("REGEX", f"  {tag} ← {val}")
+
+    # ── Passes LLM ────────────────────────────────────────────
+    llm_entity_map = {}
+
+    if use_llm:
+        # Vérification connexion Ollama
+        log.log("LLM", f"Test connexion Ollama ({ollama_url})...", progress=0.15)
+        connected, msg, _ = check_ollama(ollama_url, model)
+        if not connected:
+            log.log("ERROR", f"Connexion Ollama impossible : {msg}")
+            log.log("ERROR", "Lance 'ollama serve' et réessaie.")
+            # On continue en mode regex-only plutôt que de planter
+            log.log("WARN", "Fallback en mode regex uniquement.")
+            use_llm = False
+
+    if use_llm:
+        log.log("OK", f"Ollama OK. Modèle {model}.")
+        chunks = split_into_chunks(text, chunk_size)
+        total_chunks = len(chunks) * min(passes, 3)
+        done_chunks = 0
+
+        # --- Passe 2 : Anonymisation principale ---
+        log.log("LLM", f"Passe 2 : Anonymisation NER ({len(chunks)} chunk(s), modèle {model})...",
+                progress=0.2)
+        log.stats["llm_passes"] += 1
+        result_chunks = []
+        for i, chunk in enumerate(chunks, 1):
+            log.log("LLM", f"  Chunk [{i}/{len(chunks)}] ({len(chunk)} chars)...")
+            result, success = call_ollama_chat(
+                chunk, SYSTEM_PROMPT_PASS2,
+                model=model, base_url=ollama_url, timeout=timeout
+            )
+            if success:
+                log.log("OK", f"  Chunk [{i}/{len(chunks)}] traité.")
+            else:
+                log.log("ERROR", f"  Chunk [{i}/{len(chunks)}] erreur — texte original conservé.")
+                log.stats["llm_erreurs"] += 1
+            result_chunks.append(result)
+            log.stats["llm_chunks_traites"] += 1
+            done_chunks += 1
+            progress = 0.2 + (done_chunks / total_chunks) * 0.65
+            if on_progress:
+                on_progress(f"Passe 2 — chunk {i}/{len(chunks)}", progress)
+
+        text = "\n\n".join(result_chunks)
+
+        # --- Passe 3 : Vérification LLM ---
+        if passes >= 2:
+            chunks2 = split_into_chunks(text, chunk_size)
+            log.log("LLM", f"Passe 3 : Vérification NER ({len(chunks2)} chunk(s))...")
+            log.stats["llm_passes"] += 1
+            result_chunks2 = []
+            for i, chunk in enumerate(chunks2, 1):
+                log.log("LLM", f"  Vérif [{i}/{len(chunks2)}]...")
+                result, success = call_ollama_chat(
+                    chunk, SYSTEM_PROMPT_PASS3,
+                    model=model, base_url=ollama_url, timeout=timeout
+                )
+                if success:
+                    log.log("OK", f"  Vérif [{i}/{len(chunks2)}] OK.")
+                else:
+                    log.log("WARN", f"  Vérif [{i}/{len(chunks2)}] erreur — texte précédent conservé.")
+                    log.stats["llm_erreurs"] += 1
+                result_chunks2.append(result)
+                log.stats["llm_chunks_traites"] += 1
+                done_chunks += 1
+                progress = 0.2 + (done_chunks / total_chunks) * 0.65
+                if on_progress:
+                    on_progress(f"Passe 3 vérif — chunk {i}/{len(chunks2)}", progress)
+
+            text = "\n\n".join(result_chunks2)
+
+        # --- Passe 4 optionnelle : re-vérif stricte ---
+        if passes >= 3:
+            chunks3 = split_into_chunks(text, chunk_size)
+            log.log("LLM", f"Passe 4 : Re-vérification stricte ({len(chunks3)} chunk(s))...")
+            log.stats["llm_passes"] += 1
+            result_chunks3 = []
+            for i, chunk in enumerate(chunks3, 1):
+                log.log("LLM", f"  Strict [{i}/{len(chunks3)}]...")
+                result, success = call_ollama_chat(
+                    chunk, SYSTEM_PROMPT_PASS3,
+                    model=model, base_url=ollama_url, timeout=timeout
+                )
+                result_chunks3.append(result)
+                log.stats["llm_chunks_traites"] += 1
+                done_chunks += 1
+                progress = 0.2 + (done_chunks / total_chunks) * 0.65
+                if on_progress:
+                    on_progress(f"Passe 4 strict — chunk {i}/{len(chunks3)}", progress)
+            text = "\n\n".join(result_chunks3)
+
+        llm_entity_map = count_llm_tags(text)
+        if llm_entity_map:
+            log.log("LLM", "Tags LLM détectés dans le résultat :")
+            for tag, count in sorted(llm_entity_map.items()):
+                log.log("LLM", f"  {tag} × {count}")
+    else:
+        log.log("INFO", "Passe LLM ignorée.")
+
+    # ── Vérification finale (regex) ────────────────────────────
+    log.log("VERIF", "Vérification post-anonymisation (regex)...", progress=0.9)
+    warnings = post_check(text)
+    log.stats["verif_warnings"] = warnings
+    if warnings:
+        for w in warnings:
+            log.log("WARN", w)
+    else:
+        log.log("OK", "Aucun pattern résiduel détecté.")
+
+    log.stats["taille_finale"] = len(text)
+    log.stats["duree_totale"] = round(time.time() - log.start_time, 2)
+
+    # ── Construction du mapping ──────────────────────────────
+    mapping_export = {}
+    for key, tag in regex_anon.mapping.items():
+        _, original = key.split("::", 1)
+        mapping_export[tag] = original
+    for tag in llm_entity_map:
+        if tag not in mapping_export:
+            mapping_export[tag] = "⟨détecté par LLM — valeur originale non tracée⟩"
+
+    # ── Rapport ──────────────────────────────────────────────
+    report = log.generate_report(regex_anon, llm_entity_map)
+
+    log.log("DONE", "Anonymisation terminée.", progress=1.0)
+
+    return {
+        "text": text,
+        "mapping": mapping_export,
+        "report": report,
+        "warnings": warnings,
+        "stats": log.stats,
+    }
+
+
+# =============================================================================
+# CLI
 # =============================================================================
 
 def main():
@@ -474,167 +756,50 @@ Exemples :
         print(f"❌ Fichier introuvable : {filepath}", file=sys.stderr)
         sys.exit(1)
 
-    log = Logger()
-    log.stats["fichier_source"] = str(filepath)
-
     print(f"\n{'='*60}")
     print(f"  ANONYMISATION — {filepath.name}")
     print(f"{'='*60}\n")
 
-    # ── Lecture ──────────────────────────────────────────────────
-    log.log("INFO", f"Lecture de {filepath.name}...")
+    # Lecture
     text = read_file(filepath)
-    log.stats["taille_originale"] = len(text)
-    log.log("INFO", f"{len(text)} caractères lus.")
 
-    # ── Passe 1 : Regex ────────────────────────────────────────
-    log.log("REGEX", "Passe 1 : Anonymisation regex (IP, email, date, tél, FQDN, chemins)...")
-    regex_anon = RegexAnonymizer()
-    text = regex_anon.anonymize(text)
-    log.stats["regex_remplacements"] = len(regex_anon.mapping)
-    log.log("REGEX", f"{len(regex_anon.mapping)} patterns remplacés.")
+    # Exécution pipeline
+    result = run_pipeline(
+        text=text,
+        filename=filepath.name,
+        use_llm=not args.no_llm,
+        model=args.model,
+        ollama_url=args.ollama_url,
+        chunk_size=args.chunk_size,
+        passes=args.passes,
+        timeout=args.timeout,
+    )
 
-    for key, tag in regex_anon.mapping.items():
-        cat, val = key.split("::", 1)
-        log.log("REGEX", f"  {tag} ← {val}")
-
-    # ── Passe 2 : LLM anonymisation ───────────────────────────
-    llm_entity_map = {}
-
-    if not args.no_llm:
-        # Vérification connexion Ollama
-        log.log("LLM", f"Test connexion Ollama ({args.ollama_url})...")
-        try:
-            r = requests.get(f"{args.ollama_url}/api/tags", timeout=5)
-            r.raise_for_status()
-            models = [m["name"] for m in r.json().get("models", [])]
-            if not any(args.model in m for m in models):
-                log.log("WARN", f"Modèle '{args.model}' non trouvé. Disponibles : {', '.join(models)}")
-                log.log("WARN", "Tentative quand même...")
-            else:
-                log.log("OK", f"Ollama OK. Modèle {args.model} trouvé.")
-        except Exception as e:
-            log.log("ERROR", f"Connexion Ollama impossible : {e}")
-            log.log("ERROR", "Lance 'ollama serve' et réessaie.")
-            sys.exit(1)
-
-        chunks = split_into_chunks(text, args.chunk_size)
-
-        # --- Passe 2 : Anonymisation principale ---
-        log.log("LLM", f"Passe 2 : Anonymisation NER ({len(chunks)} chunk(s), modèle {args.model})...")
-        log.stats["llm_passes"] += 1
-        result_chunks = []
-        for i, chunk in enumerate(chunks, 1):
-            log.log("LLM", f"  Chunk [{i}/{len(chunks)}] ({len(chunk)} chars)...")
-            result, success = call_ollama_chat(
-                chunk, SYSTEM_PROMPT_PASS2,
-                model=args.model, base_url=args.ollama_url, timeout=args.timeout
-            )
-            if success:
-                log.log("OK", f"  Chunk [{i}/{len(chunks)}] traité.")
-            else:
-                log.log("ERROR", f"  Chunk [{i}/{len(chunks)}] erreur — texte original conservé.")
-                log.stats["llm_erreurs"] += 1
-            result_chunks.append(result)
-            log.stats["llm_chunks_traites"] += 1
-
-        text = "\n\n".join(result_chunks)
-
-        # --- Passe 3 : Vérification LLM ---
-        if args.passes >= 2:
-            chunks2 = split_into_chunks(text, args.chunk_size)
-            log.log("LLM", f"Passe 3 : Vérification NER ({len(chunks2)} chunk(s))...")
-            log.stats["llm_passes"] += 1
-            result_chunks2 = []
-            for i, chunk in enumerate(chunks2, 1):
-                log.log("LLM", f"  Vérif [{i}/{len(chunks2)}]...")
-                result, success = call_ollama_chat(
-                    chunk, SYSTEM_PROMPT_PASS3,
-                    model=args.model, base_url=args.ollama_url, timeout=args.timeout
-                )
-                if success:
-                    log.log("OK", f"  Vérif [{i}/{len(chunks2)}] OK.")
-                else:
-                    log.log("WARN", f"  Vérif [{i}/{len(chunks2)}] erreur — texte précédent conservé.")
-                    log.stats["llm_erreurs"] += 1
-                result_chunks2.append(result)
-                log.stats["llm_chunks_traites"] += 1
-
-            text = "\n\n".join(result_chunks2)
-
-        # --- Passe 4 optionnelle : re-vérif stricte ---
-        if args.passes >= 3:
-            chunks3 = split_into_chunks(text, args.chunk_size)
-            log.log("LLM", f"Passe 4 : Re-vérification stricte ({len(chunks3)} chunk(s))...")
-            log.stats["llm_passes"] += 1
-            result_chunks3 = []
-            for i, chunk in enumerate(chunks3, 1):
-                log.log("LLM", f"  Strict [{i}/{len(chunks3)}]...")
-                result, success = call_ollama_chat(
-                    chunk, SYSTEM_PROMPT_PASS3,
-                    model=args.model, base_url=args.ollama_url, timeout=args.timeout
-                )
-                result_chunks3.append(result)
-                log.stats["llm_chunks_traites"] += 1
-            text = "\n\n".join(result_chunks3)
-
-        llm_entity_map = count_llm_tags(text)
-        if llm_entity_map:
-            log.log("LLM", f"Tags LLM détectés dans le résultat :")
-            for tag, count in sorted(llm_entity_map.items()):
-                log.log("LLM", f"  {tag} × {count}")
-    else:
-        log.log("INFO", "Passe LLM ignorée (--no-llm).")
-
-    # ── Vérification finale (regex) ────────────────────────────
-    log.log("VERIF", "Vérification post-anonymisation (regex)...")
-    warnings = post_check(text)
-    log.stats["verif_warnings"] = warnings
-    if warnings:
-        for w in warnings:
-            log.log("WARN", w)
-    else:
-        log.log("OK", "Aucun pattern résiduel détecté.")
-
-    log.stats["taille_finale"] = len(text)
-
-    # ── Écriture des fichiers ──────────────────────────────────
+    # Écriture des fichiers
     output_path = Path(args.output) if args.output else filepath.with_name(f"{filepath.stem}_anonymise.md")
-    output_path.write_text(text, encoding="utf-8")
-    log.log("DONE", f"Fichier anonymisé : {output_path}")
+    output_path.write_text(result["text"], encoding="utf-8")
 
-    # Mapping (dé-anonymisation)
     mapping_path = filepath.with_name(f"{filepath.stem}_mapping.json")
-    mapping_export = {}
-    for key, tag in regex_anon.mapping.items():
-        _, original = key.split("::", 1)
-        mapping_export[tag] = original
-    # Ajouter les tags LLM détectés (sans valeur originale, on ne les connaît pas)
-    for tag in llm_entity_map:
-        if tag not in mapping_export:
-            mapping_export[tag] = "⟨détecté par LLM — valeur originale non tracée⟩"
-    mapping_path.write_text(json.dumps(mapping_export, indent=2, ensure_ascii=False), encoding="utf-8")
-    log.log("DONE", f"Table de correspondance : {mapping_path}")
+    mapping_path.write_text(json.dumps(result["mapping"], indent=2, ensure_ascii=False), encoding="utf-8")
 
-    # Rapport
     report_path = filepath.with_name(f"{filepath.stem}_rapport.md")
-    report = log.generate_report(regex_anon, llm_entity_map)
-    report_path.write_text(report, encoding="utf-8")
-    log.log("DONE", f"Rapport complet : {report_path}")
+    report_path.write_text(result["report"], encoding="utf-8")
 
-    # ── Résumé final ───────────────────────────────────────────
+    # Résumé final
+    s = result["stats"]
     print(f"\n{'='*60}")
     print(f"  RÉSUMÉ")
     print(f"{'='*60}")
     print(f"  📄 Source       : {filepath.name}")
-    print(f"  📏 Taille       : {log.stats['taille_originale']} → {log.stats['taille_finale']} chars")
-    print(f"  🔍 Regex        : {log.stats['regex_remplacements']} remplacements")
-    print(f"  🤖 LLM          : {log.stats['llm_passes']} passes, {log.stats['llm_chunks_traites']} chunks")
-    if log.stats['llm_erreurs']:
-        print(f"  ❌ Erreurs LLM  : {log.stats['llm_erreurs']}")
-    print(f"  🏷️  Tags LLM     : {sum(llm_entity_map.values())} occurrences ({len(llm_entity_map)} uniques)")
-    print(f"  ⚠️  Warnings     : {len(warnings)}")
-    print(f"  ⏱️  Durée        : {log.stats['duree_totale']}s")
+    print(f"  📏 Taille       : {s['taille_originale']} → {s['taille_finale']} chars")
+    if s["custom_remplacements"]:
+        print(f"  🏷️  Custom       : {s['custom_remplacements']} remplacements")
+    print(f"  🔍 Regex        : {s['regex_remplacements']} remplacements")
+    print(f"  🤖 LLM          : {s['llm_passes']} passes, {s['llm_chunks_traites']} chunks")
+    if s['llm_erreurs']:
+        print(f"  ❌ Erreurs LLM  : {s['llm_erreurs']}")
+    print(f"  ⚠️  Warnings     : {len(result['warnings'])}")
+    print(f"  ⏱️  Durée        : {s['duree_totale']}s")
     print(f"  ✅ Sortie       : {output_path}")
     print(f"  📊 Rapport      : {report_path}")
     print(f"  🔑 Mapping      : {mapping_path}")

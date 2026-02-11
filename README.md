@@ -91,7 +91,7 @@ ollama serve
 ### 3. Install Python dependencies
 
 ```bash
-pip install requests python-docx pymupdf
+pip install -r requirements.txt
 ```
 
 Or create a virtual environment:
@@ -101,7 +101,7 @@ python -m venv .venv
 .venv\Scripts\activate
 # Linux/macOS:
 source .venv/bin/activate
-pip install requests python-docx pymupdf
+pip install -r requirements.txt
 ```
 
 ## Usage
@@ -180,6 +180,24 @@ python anonymize.py big_file.docx --chunk-size 2000
 | `[LIEU_n]` | Physical addresses / cities | LLM |
 | `[REF_n]` | Contract numbers, client refs | LLM |
 
+## Web interface (Streamlit)
+
+A graphical interface is available for drag & drop usage:
+
+```bash
+streamlit run app.py
+```
+
+Features:
+- Drag & drop file upload
+- Custom words/names to anonymize (with category selection)
+- Real-time progress bar
+- Before/after preview
+- Download anonymized file, mapping, and report
+- Ollama connection status indicator
+
+The model is fixed to `gpt-oss:20b`.
+
 ## LLM prompt design notes
 
 The prompts used for the local LLM are critical for quality. Key principles:
@@ -230,17 +248,32 @@ ollama serve  # si pas déjà lancé
 ### 3. Installer les dépendances Python
 
 ```bash
-pip install requests python-docx pymupdf
+pip install -r requirements.txt
 ```
 
 ## Utilisation
+
+### Interface graphique (recommandé)
+
+```bash
+streamlit run app.py
+```
+
+Ouvre une interface dans le navigateur avec :
+- Glisser-déposer de fichiers
+- Saisie de mots/noms personnalisés à anonymiser
+- Barre de progression en temps réel
+- Prévisualisation avant/après
+- Téléchargement des résultats
+
+### Ligne de commande
 
 ```bash
 # Utilisation simple
 python anonymize.py document.docx
 
 # Avec options
-python anonymize.py rapport.pdf --model gpt-oss:120b --passes 3
+python anonymize.py rapport.pdf --passes 3
 python anonymize.py notes.md --no-llm -o notes_clean.md
 ```
 
