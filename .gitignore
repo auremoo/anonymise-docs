@@ -1,0 +1,23 @@
+# Fichiers générés par l'anonymisation (contiennent des données sensibles)
+*_mapping.json
+*_anonymise.md
+*_rapport.md
+
+# Documents source (ne doivent pas être commités)
+*.docx
+*.pdf
+*.doc
+*.xlsx
+*.xls
+*.pptx
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
