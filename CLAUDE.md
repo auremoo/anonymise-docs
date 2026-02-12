@@ -123,7 +123,7 @@ Les prompts système sont dans les constantes `SYSTEM_PROMPT_PASS2` et `SYSTEM_P
 
 ```bash
 # Interface web
-streamlit run app.py
+python -m streamlit run app.py
 
 # CLI — usage standard (avec extraction d'images)
 python anonymize.py document.docx

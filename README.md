@@ -187,7 +187,7 @@ python anonymize.py big_file.docx --chunk-size 2000
 A graphical interface is available for drag & drop usage:
 
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 Features:
@@ -261,7 +261,7 @@ pip install -r requirements.txt
 ### Interface graphique (recommandé)
 
 ```bash
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 Ouvre une interface dans le navigateur avec :
