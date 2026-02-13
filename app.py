@@ -168,6 +168,16 @@ TEXTS = {
         "FR": "mot(s) chargé(s) depuis le dictionnaire",
         "EN": "word(s) loaded from dictionary",
     },
+    "deep_analysis": {
+        "FR": "Analyse approfondie",
+        "EN": "Deep analysis",
+    },
+    "deep_analysis_help": {
+        "FR": "Le LLM réfléchit plus — plus précis pour les noms/prénoms "
+              "mais plus lent",
+        "EN": "LLM thinks deeper — more accurate for names "
+              "but slower",
+    },
 }
 
 
@@ -371,7 +381,7 @@ if st.button(
 
 st.subheader(t("options_title"))
 
-col1, col2, col3 = st.columns(3)
+col1, col2, col3, col4 = st.columns(4)
 with col1:
     passes = st.radio(
         t("passes_label"),
@@ -389,6 +399,13 @@ with col2:
         disabled=pipe["running"],
     )
 with col3:
+    deep_analysis = st.checkbox(
+        t("deep_analysis"),
+        value=False,
+        help=t("deep_analysis_help"),
+        disabled=pipe["running"] or no_llm,
+    )
+with col4:
     extract_imgs = st.checkbox(
         t("extract_images"),
         value=True,
@@ -479,6 +496,7 @@ if run_clicked:
     _images = images
     _images_folder = images_folder
     _filename_stem = filename_stem
+    _deep_analysis = deep_analysis
 
     def on_progress(message: str, percent: float):
         _pipe["msg"] = message
@@ -498,6 +516,7 @@ if run_clicked:
                 cancel_flag=_cancel_flag,
                 images_count=len(_images),
                 images_folder=_images_folder,
+                deep_analysis=_deep_analysis,
             )
             _pipe["result"] = result
 

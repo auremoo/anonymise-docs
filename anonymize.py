@@ -352,9 +352,9 @@ class RegexAnonymizer:
 # PASSE 2 + 3 : LLM via Ollama /api/chat
 # =============================================================================
 
-SYSTEM_PROMPT_PASS2 = """Reasoning: low
+SYSTEM_PROMPT_PASS2 = """Tu es un outil d'anonymisation de documents techniques (industriel, IT/OT, cybersécurité). Remplace les entités nommées par des tags. Ne fais RIEN d'autre.
 
-Tu es un outil d'anonymisation. Remplace les entités nommées par des tags. Ne fais RIEN d'autre.
+Lis d'abord le texte en entier pour repérer toutes les entités, puis remplace-les de manière cohérente.
 
 CATÉGORIES À REMPLACER :
 - Noms de personnes (prénoms, noms, initiales "J. Dupont") → [PERSONNE_1], [PERSONNE_2]...
@@ -371,6 +371,20 @@ RÈGLES :
 4. Tags existants ([IP_1], [EMAIL_1], [DATE_1], [TEL_1], [SERVEUR_1], [CHEMIN_1], [SECRET_1], [IMAGE_1]...) → INTACTS.
 5. En cas de doute → NE remplace PAS.
 
+EXEMPLES :
+
+Entrée : "Jean Dupont de la société Acme a visité l'usine de Lyon le [DATE_1]."
+Sortie : "[PERSONNE_1] de la société [ENTREPRISE_1] a visité l'usine de [LIEU_1] le [DATE_1]."
+
+Entrée : "Pour toute question, contactez Pierre à Strasbourg ou écrivez à [EMAIL_1]."
+Sortie : "Pour toute question, contactez [PERSONNE_1] à [LIEU_1] ou écrivez à [EMAIL_1]."
+
+Entrée : "J.D. de Sogetrel, contrat N°ABC-2024-0456, a réalisé l'audit du site de Fos-sur-Mer."
+Sortie : "[PERSONNE_1] de [ENTREPRISE_1], contrat [REF_1], a réalisé l'audit du site de [LIEU_1]."
+
+Entrée : "Cordialement,\\nMarie Lefevre\\nNexans — site de Bourg-en-Bresse\\nProjet INDUS-2025"
+Sortie : "Cordialement,\\n[PERSONNE_1]\\n[ENTREPRISE_1] — site de [LIEU_1]\\n[PROJET_1]"
+
 NE SONT PAS DES ENTITÉS (ne pas remplacer) :
 - Marques technologiques utilisées comme termes techniques :
   Siemens, Schneider Electric, Rockwell, ABB, Honeywell, Yokogawa, Emerson, Beckhoff,
@@ -384,15 +398,9 @@ NE SONT PAS DES ENTITÉS (ne pas remplacer) :
   PLC, RTU, HMI, DCS, SIS, MES, ERP, CMMS, GMAO, SNMP, VPN, DMZ, VLAN, firewall,
   automate, variateur, IHM, superviseur, historian, API REST, base de données
 
-EXEMPLE :
-Entrée : "Jean Dupont de la société Acme a visité l'usine de Lyon le [DATE_1]."
-Sortie : "[PERSONNE_1] de la société [ENTREPRISE_1] a visité l'usine de [LIEU_1] le [DATE_1]."
-
 Retourne UNIQUEMENT le texte anonymisé. Aucun commentaire, aucune explication."""
 
-SYSTEM_PROMPT_PASS3 = """Reasoning: low
-
-Tu es un vérificateur d'anonymisation. Le texte a déjà été anonymisé mais il peut rester des oublis.
+SYSTEM_PROMPT_PASS3 = """Tu es un vérificateur d'anonymisation de documents techniques. Le texte a déjà été partiellement anonymisé mais il peut rester des oublis.
 
 CHERCHE SPÉCIFIQUEMENT ces oublis fréquents :
 - Prénoms isolés ("contactez Pierre", "signé Marie")
@@ -405,6 +413,14 @@ CHERCHE SPÉCIFIQUEMENT ces oublis fréquents :
 POUR CHAQUE OUBLI TROUVÉ :
 - Utilise le tag suivant libre (ex: s'il y a déjà [PERSONNE_1] et [PERSONNE_2], utilise [PERSONNE_3])
 - Si l'entité correspond à un tag existant, réutilise ce tag
+
+EXEMPLES DE CORRECTIONS :
+
+Avant : "[PERSONNE_1] a contacté Marc pour valider le projet."
+Après : "[PERSONNE_1] a contacté [PERSONNE_2] pour valider le projet."
+
+Avant : "Livraison prévue à Toulouse, bâtiment B3, pour le client Nexans."
+Après : "Livraison prévue à [LIEU_1], bâtiment [SITE_1], pour le client [ENTREPRISE_1]."
 
 NE TOUCHE PAS :
 - Aux tags déjà en place ([PERSONNE_1], [IP_1], [LIEU_1], [ENTREPRISE_1], [REF_1], [SECRET_1], [IMAGE_1]... etc.)
@@ -429,7 +445,7 @@ def call_ollama_chat(text: str, system_prompt: str, model: str = "gpt-oss:20b",
                 "messages": [
                     {"role": "system", "content": system_prompt},
                     {"role": "user",
-                     "content": f"Voici le texte à traiter :\n\n{text}"}
+                     "content": f"Anonymise ce texte :\n\n{text}"}
                 ],
                 "stream": False,
                 "options": {
@@ -846,6 +862,7 @@ def run_pipeline(
     cancel_flag: threading.Event | None = None,
     images_count: int = 0,
     images_folder: str = "",
+    deep_analysis: bool = False,
 ) -> dict:
     """
     Execute the full anonymization pipeline.
@@ -905,14 +922,21 @@ def run_pipeline(
             use_llm = False
 
     if use_llm and not cancelled:
-        log.log("OK", f"Ollama OK — {model}.", progress=0.18)
+        # Préfixe Reasoning: low pour le mode rapide (par défaut)
+        reasoning_prefix = "" if deep_analysis else "Reasoning: low\n\n"
+        prompt_p2 = reasoning_prefix + SYSTEM_PROMPT_PASS2
+        prompt_p3 = reasoning_prefix + SYSTEM_PROMPT_PASS3
+
+        mode_label = "approfondie" if deep_analysis else "rapide"
+        log.log("OK", f"Ollama OK — {model} (analyse {mode_label}).",
+                progress=0.18)
         chunks = split_into_chunks(text, chunk_size)
         total_chunks = len(chunks) * min(passes, 3)
         done_ref = [0]  # mutable for pass-by-reference
 
         # Passe 2
         result_chunks = _run_llm_pass(
-            chunks, SYSTEM_PROMPT_PASS2, "Passe 2", log, model, ollama_url,
+            chunks, prompt_p2, "Passe 2", log, model, ollama_url,
             timeout, cancel_flag, on_progress, done_ref, total_chunks,
         )
         text = "\n\n".join(result_chunks)
@@ -921,7 +945,7 @@ def run_pipeline(
         if passes >= 2 and not (cancel_flag and cancel_flag.is_set()):
             chunks2 = split_into_chunks(text, chunk_size)
             result_chunks2 = _run_llm_pass(
-                chunks2, SYSTEM_PROMPT_PASS3, "Passe 3 vérif", log, model,
+                chunks2, prompt_p3, "Passe 3 vérif", log, model,
                 ollama_url, timeout, cancel_flag, on_progress,
                 done_ref, total_chunks,
             )
@@ -931,7 +955,7 @@ def run_pipeline(
         if passes >= 3 and not (cancel_flag and cancel_flag.is_set()):
             chunks3 = split_into_chunks(text, chunk_size)
             result_chunks3 = _run_llm_pass(
-                chunks3, SYSTEM_PROMPT_PASS3, "Passe 4 strict", log, model,
+                chunks3, prompt_p3, "Passe 4 strict", log, model,
                 ollama_url, timeout, cancel_flag, on_progress,
                 done_ref, total_chunks,
             )
@@ -1007,6 +1031,11 @@ Exemples :
         help="Dictionnaire de mots sensibles (JSON). "
              "Défaut : sensitive-words.json à côté du script",
     )
+    parser.add_argument(
+        "--deep", action="store_true",
+        help="Analyse approfondie — le LLM réfléchit plus "
+             "(plus précis, plus lent)",
+    )
 
     args = parser.parse_args()
     filepath = Path(args.fichier)
@@ -1043,6 +1072,7 @@ Exemples :
         passes=args.passes, timeout=args.timeout,
         images_count=len(images),
         images_folder=images_folder_name,
+        deep_analysis=args.deep,
     )
 
     output_path = (
