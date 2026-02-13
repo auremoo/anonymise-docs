@@ -4,6 +4,7 @@ output/
 *_anonymise.md
 *_rapport.md
 *_images/
+sensitive-words.json
 
 # Documents source (ne doivent pas être commités)
 *.docx

@@ -30,7 +30,7 @@ You want to use Claude, ChatGPT, or any cloud AI to analyze your documents — b
 
 | Pass | Engine | What it catches |
 |------|--------|----------------|
-| 1 | **Regex** | IPv4/v6, FQDN (.local, .corp...), emails, phone numbers, dates (FR/ISO), UNC paths, Linux home paths |
+| 1 | **Regex** | IPv4/v6, FQDN (.local, .corp...), emails, phone numbers, dates (FR/ISO), UNC paths, Linux home paths, credentials/API keys |
 | 2 | **Local LLM** | Person names, company names, site/building names, internal project names, physical addresses |
 | 3 | **Local LLM** | Verification pass — catches anything missed by pass 2 |
 | 4 | **Local LLM** (optional) | Strict re-verification (`--passes 3`) |
@@ -143,6 +143,7 @@ python anonymize.py big_file.docx --chunk-size 2000
 | `--chunk-size` | `4000` | Max characters per LLM chunk |
 | `--passes` | `2` | LLM passes: 1, 2, or 3 |
 | `--timeout` | `300` | Timeout per Ollama request (seconds) |
+| `--dict` | `sensitive-words.json` | Persistent dictionary of sensitive words (JSON) |
 
 ### Supported file formats
 
@@ -174,6 +175,7 @@ python anonymize.py big_file.docx --chunk-size 2000
 | `[DATE_n]` | Dates | Regex |
 | `[SERVEUR_n]` | FQDN / server names | Regex |
 | `[CHEMIN_n]` | File paths (UNC, Linux) | Regex |
+| `[SECRET_n]` | Credentials, connection strings, API keys | Regex |
 | `[PERSONNE_n]` | Person names | LLM |
 | `[ENTREPRISE_n]` | Company / organization names | LLM |
 | `[SITE_n]` | Site / building names | LLM |
@@ -193,7 +195,7 @@ python -m streamlit run app.py
 Features:
 - Bilingual interface (FR/EN toggle)
 - Drag & drop file upload
-- Custom words/names to anonymize (with category selection)
+- Custom words/names to anonymize (with persistent `sensitive-words.json` dictionary)
 - LLM model selector (auto-detects installed Ollama models)
 - Real-time progress bar with elapsed time
 - Stop button to cancel long-running anonymization
@@ -225,7 +227,7 @@ Vous voulez utiliser Claude, ChatGPT, ou tout autre IA cloud pour analyser vos d
 
 | Passe | Moteur | Ce qu'elle détecte |
 |-------|--------|-------------------|
-| 1 | **Regex** | IPv4/v6, FQDN (.local, .corp...), emails, téléphones, dates (FR/ISO), chemins UNC, chemins Linux |
+| 1 | **Regex** | IPv4/v6, FQDN (.local, .corp...), emails, téléphones, dates (FR/ISO), chemins UNC, chemins Linux, credentials/clés API |
 | 2 | **LLM local** | Noms de personnes, entreprises, sites/usines, projets internes, adresses physiques |
 | 3 | **LLM local** | Passe de vérification — attrape les oublis de la passe 2 |
 | 4 | **LLM local** (optionnel) | Re-vérification stricte (`--passes 3`) |
@@ -267,7 +269,7 @@ python -m streamlit run app.py
 Ouvre une interface dans le navigateur avec :
 - Interface bilingue (FR/EN)
 - Glisser-déposer de fichiers
-- Saisie de mots/noms personnalisés à anonymiser
+- Saisie de mots/noms personnalisés à anonymiser (avec dictionnaire persistant `sensitive-words.json`)
 - Sélection du modèle LLM (détection automatique des modèles Ollama installés)
 - Barre de progression en temps réel avec chronomètre
 - Bouton d'arrêt pour annuler un traitement long
@@ -284,6 +286,9 @@ python anonymize.py document.docx
 # Avec options
 python anonymize.py rapport.pdf --passes 3
 python anonymize.py notes.md --no-llm -o notes_clean.md
+
+# Avec dictionnaire personnalisé
+python anonymize.py document.docx --dict mes_mots.json
 ```
 
 ## Fichiers générés

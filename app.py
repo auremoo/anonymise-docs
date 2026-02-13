@@ -18,6 +18,8 @@ from anonymize import (
     run_pipeline,
     save_images,
     check_ollama,
+    load_sensitive_words,
+    save_sensitive_words,
 )
 
 # =============================================================================
@@ -154,6 +156,18 @@ TEXTS = {
               "the model does not seem to anonymize. "
               "Try a larger model or check it supports NER.",
     },
+    "btn_save_dict": {
+        "FR": "Sauvegarder le dictionnaire",
+        "EN": "Save dictionary",
+    },
+    "dict_saved": {
+        "FR": "Dictionnaire sauvegardé",
+        "EN": "Dictionary saved",
+    },
+    "dict_loaded": {
+        "FR": "mot(s) chargé(s) depuis le dictionnaire",
+        "EN": "word(s) loaded from dictionary",
+    },
 }
 
 
@@ -173,7 +187,7 @@ DEFAULT_MODEL = "gpt-oss:20b"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 CATEGORIES = [
-    "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "LIEU", "REF",
+    "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "LIEU", "REF", "SECRET",
 ]
 
 SUPPORTED_EXTENSIONS = [
@@ -290,10 +304,29 @@ st.subheader(t("custom_words_title"))
 st.caption(t("custom_words_caption"))
 
 if "custom_words_df" not in st.session_state:
-    st.session_state.custom_words_df = pd.DataFrame(
-        [{t("col_word"): "", t("col_category"): "PERSONNE"}],
-        columns=[t("col_word"), t("col_category")],
+    # Load persistent dictionary on first run
+    saved_words = load_sensitive_words()
+    if saved_words:
+        rows = [
+            {t("col_word"): word, t("col_category"): cat}
+            for word, cat in saved_words.items()
+        ]
+        st.session_state.custom_words_df = pd.DataFrame(
+            rows, columns=[t("col_word"), t("col_category")],
+        )
+        st.session_state._dict_loaded_count = len(saved_words)
+    else:
+        st.session_state.custom_words_df = pd.DataFrame(
+            [{t("col_word"): "", t("col_category"): "PERSONNE"}],
+            columns=[t("col_word"), t("col_category")],
+        )
+
+# Show load notification once
+if st.session_state.get("_dict_loaded_count", 0) > 0:
+    st.info(
+        f"{st.session_state._dict_loaded_count} {t('dict_loaded')}"
     )
+    st.session_state._dict_loaded_count = 0
 
 # Rebuild column names if language changed
 col_word = t("col_word")
@@ -319,6 +352,20 @@ edited_df = st.data_editor(
     key="custom_editor",
     disabled=pipe["running"],
 )
+
+# Save dictionary button
+if st.button(
+    f"\U0001f4be {t('btn_save_dict')}",
+    disabled=pipe["running"],
+):
+    words_to_save = {}
+    for _, row in edited_df.iterrows():
+        word = str(row[col_word]).strip()
+        cat = str(row[col_cat]).strip()
+        if word:
+            words_to_save[word] = cat
+    save_sensitive_words(words_to_save)
+    st.success(f"{t('dict_saved')} ({len(words_to_save)} mots)")
 
 # ── Options ──────────────────────────────────────────────────
 

@@ -202,6 +202,51 @@ def apply_custom_words(
 
 
 # =============================================================================
+# DICTIONNAIRE PERSISTANT
+# =============================================================================
+
+DICT_PATH = Path(__file__).resolve().parent / "sensitive-words.json"
+
+
+def load_sensitive_words(filepath: Path | None = None) -> dict[str, str]:
+    """Charge un dictionnaire de mots sensibles.
+    Format fichier : {"CATEGORIE": ["mot1", "mot2"], ...}
+    Retourne : {mot: catégorie} pour apply_custom_words().
+    """
+    path = filepath or DICT_PATH
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        words: dict[str, str] = {}
+        for category, word_list in data.items():
+            for word in word_list:
+                if word.strip():
+                    words[word.strip()] = category.upper()
+        return words
+    except Exception:
+        return {}
+
+
+def save_sensitive_words(
+    words: dict[str, str], filepath: Path | None = None,
+):
+    """Sauvegarde le dictionnaire de mots sensibles.
+    Entrée : {mot: catégorie}
+    Format fichier : {"CATEGORIE": ["mot1", "mot2"], ...}
+    """
+    path = filepath or DICT_PATH
+    grouped: dict[str, list[str]] = defaultdict(list)
+    for word, category in sorted(words.items()):
+        if word.strip():
+            grouped[category.upper()].append(word.strip())
+    path.write_text(
+        json.dumps(dict(grouped), indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
+
+
+# =============================================================================
 # PASSE 1 : Regex
 # =============================================================================
 
@@ -239,6 +284,21 @@ class RegexAnonymizer:
         text = re.sub(
             r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',
             lambda m: self._get_tag("EMAIL", m.group(0)), text)
+        # ── Credentials / connection strings ──
+        # Password=xxx, Pwd=xxx, User ID=xxx dans les connection strings
+        text = re.sub(
+            r'(?i)((?:Password|Pwd|User\s*ID|Uid)\s*=\s*)([^;"\r\n]+)',
+            lambda m: m.group(1) + self._get_tag("SECRET", m.group(2)),
+            text)
+        # Champs JSON sensibles : "ApiKey": "xxx"
+        text = re.sub(
+            r'(?i)("(?:Password|Pwd|Secret|ApiKey|api_key|Token|'
+            r'AccessToken|ClientSecret|client_secret|AccessKey|'
+            r'SecretKey|PrivateKey|bindCredentials)'
+            r'"\s*:\s*")([^"]+)"',
+            lambda m: m.group(1) + self._get_tag("SECRET", m.group(2))
+            + '"',
+            text)
         # ── Dates (AVANT téléphone pour éviter 29-01-2026 → TEL) ──
         text = re.sub(
             r'\b\d{1,2}[/.\-]\d{1,2}[/.\-]\d{2,4}\b',
@@ -308,7 +368,7 @@ RÈGLES :
 1. Même entité = même tag partout (ex: "Dupont" → toujours [PERSONNE_1]).
 2. NE modifie RIEN d'autre : pas de reformulation, correction, ajout ou suppression.
 3. Préserve le formatage : markdown, listes, tableaux, retours à la ligne.
-4. Tags existants ([IP_1], [EMAIL_1], [DATE_1], [TEL_1], [SERVEUR_1], [CHEMIN_1], [IMAGE_1]...) → INTACTS.
+4. Tags existants ([IP_1], [EMAIL_1], [DATE_1], [TEL_1], [SERVEUR_1], [CHEMIN_1], [SECRET_1], [IMAGE_1]...) → INTACTS.
 5. En cas de doute → NE remplace PAS.
 
 NE SONT PAS DES ENTITÉS (ne pas remplacer) :
@@ -347,7 +407,7 @@ POUR CHAQUE OUBLI TROUVÉ :
 - Si l'entité correspond à un tag existant, réutilise ce tag
 
 NE TOUCHE PAS :
-- Aux tags déjà en place ([PERSONNE_1], [IP_1], [LIEU_1], [ENTREPRISE_1], [REF_1], [IMAGE_1]... etc.)
+- Aux tags déjà en place ([PERSONNE_1], [IP_1], [LIEU_1], [ENTREPRISE_1], [REF_1], [SECRET_1], [IMAGE_1]... etc.)
 - Aux termes techniques (SCADA, WinCC, OPC UA, PLC, Siemens, Schneider, etc.)
 - Au formatage, à la structure, à la ponctuation
 
@@ -682,7 +742,7 @@ def post_check(text: str) -> list[str]:
 
 def count_llm_tags(text: str) -> dict[str, int]:
     full_tags = re.findall(
-        r'\[(?:PERSONNE|ENTREPRISE|SITE|PROJET|LIEU|REF)_\d+\]', text
+        r'\[(?:PERSONNE|ENTREPRISE|SITE|PROJET|LIEU|REF|SECRET)_\d+\]', text
     )
     tag_counts = defaultdict(int)
     for t in full_tags:
@@ -942,6 +1002,11 @@ Exemples :
     parser.add_argument("--chunk-size", type=int, default=4000)
     parser.add_argument("--passes", type=int, default=2, choices=[1, 2, 3])
     parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument(
+        "--dict", metavar="FILE",
+        help="Dictionnaire de mots sensibles (JSON). "
+             "Défaut : sensitive-words.json à côté du script",
+    )
 
     args = parser.parse_args()
     filepath = Path(args.fichier)
@@ -964,8 +1029,15 @@ Exemples :
         images_folder_name = images_dir.name
         print(f"  🖼️  {len(images)} image(s) extraite(s) → {images_dir}")
 
+    # Load dictionary (--dict or default sensitive-words.json)
+    dict_path = Path(args.dict) if args.dict else None
+    dict_words = load_sensitive_words(dict_path)
+    if dict_words:
+        print(f"  📖 Dictionnaire : {len(dict_words)} mot(s) chargé(s)")
+
     result = run_pipeline(
         text=text, filename=filepath.name,
+        custom_words=dict_words if dict_words else None,
         use_llm=not args.no_llm, model=args.model,
         ollama_url=args.ollama_url, chunk_size=args.chunk_size,
         passes=args.passes, timeout=args.timeout,

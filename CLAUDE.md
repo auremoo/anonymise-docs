@@ -43,7 +43,8 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | `run_pipeline()` | Pipeline principal — appelable depuis CLI ou UI, retourne dict. Accepte `cancel_flag` (threading.Event) et `on_progress` callback |
 | `_run_llm_pass()` | Helper DRY pour exécuter une passe LLM sur tous les chunks |
 | `apply_custom_words()` | Passe 0 — remplacement exact de mots saisis par l'utilisateur |
-| `RegexAnonymizer` | Passe 1 — patterns structurés (IP, email, dates, FQDN, chemins, téléphones) |
+| `load_sensitive_words()` / `save_sensitive_words()` | Chargement/sauvegarde du dictionnaire persistant `sensitive-words.json` |
+| `RegexAnonymizer` | Passe 1 — patterns structurés (IP, email, dates, FQDN, chemins, téléphones, credentials) |
 | `call_ollama_chat()` | Appel Ollama via `/api/chat` avec system prompt |
 | `split_into_chunks()` | Découpage intelligent (paragraphes > lignes) |
 | `post_check()` | Vérification finale regex pour patterns résiduels |
@@ -62,7 +63,8 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | Language toggle | Radio FR/EN dans la sidebar, toutes les chaînes via `t("key")` |
 | Model selector | Selectbox peuplé par `check_ollama()` (modèles installés) |
 | File uploader | Drag & drop de documents (disabled pendant l'exécution) |
-| Data editor | Tableau dynamique de mots custom à anonymiser |
+| Data editor | Tableau dynamique de mots custom à anonymiser (pré-rempli depuis `sensitive-words.json`) |
+| Save dictionary | Bouton pour sauvegarder les mots custom dans `sensitive-words.json` |
 | Image extraction | Checkbox pour activer l'extraction d'images docx/pdf |
 | Progress bar | Callback `on_progress` depuis `run_pipeline()` avec timer |
 | Stop button | Met `cancel_flag.set()`, pipeline s'arrête entre les chunks |
@@ -90,7 +92,7 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 
 Format : `[CATEGORIE_N]` avec numérotation séquentielle par catégorie.
 
-**Tags Regex** : `IP`, `EMAIL`, `TEL`, `DATE`, `SERVEUR`, `CHEMIN`
+**Tags Regex** : `IP`, `EMAIL`, `TEL`, `DATE`, `SERVEUR`, `CHEMIN`, `SECRET`
 **Tags LLM** : `PERSONNE`, `ENTREPRISE`, `SITE`, `PROJET`, `LIEU`, `REF`
 **Tags Extraction** : `IMAGE` (placeholders pour images extraites de docx/pdf)
 
@@ -131,6 +133,9 @@ python anonymize.py document.docx
 # CLI — regex seul (rapide, sans LLM)
 python anonymize.py document.docx --no-llm
 
+# CLI — avec dictionnaire personnalisé
+python anonymize.py document.docx --dict mes_mots.json
+
 # CLI — 3 passes LLM (max qualité)
 python anonymize.py document.docx --passes 3
 
@@ -148,6 +153,7 @@ pip install -r requirements.txt
 *_anonymise.md
 *_rapport.md
 *_images/
+sensitive-words.json
 *.docx
 *.pdf
 ```
