@@ -1,3 +1,4 @@
+# Anonymize Docs — Auteur : Aurélien Moote - Moo - 2026 — Licence MIT
 """
 Interface Streamlit pour l'anonymisation de documents.
 Lancement : streamlit run app.py

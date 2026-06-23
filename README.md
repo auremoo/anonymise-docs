@@ -1,5 +1,8 @@
 # Anonymize Docs
 
+> Créé par Aurélien Moote - Moo - 2026. Logiciel libre (licence MIT) :
+> réutilisable à condition de conserver la mention de l'auteur.
+
 **Hybrid document anonymization pipeline (Regex + Local LLM) for sanitizing sensitive files before sending them to cloud AI services.**
 
 > [Version française ci-dessous](#version-française)
@@ -309,6 +312,12 @@ python anonymize.py document.docx --dict mes_mots.json
 4. Garder mon_cahier_des_charges_mapping.json en privé
 ```
 
-## Licence
+## Auteur & licence / Author & License
 
-MIT
+**Auteur / Author** : Aurélien Moote - Moo - 2026
+
+Copyright (c) 2026 Aurélien Moote ("Moo") — Logiciel libre sous licence **MIT**.
+Réutilisable à condition de conserver la mention de l'auteur.
+
+Free software under the **MIT License**.
+Reuse permitted provided the author attribution is kept.

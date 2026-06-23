@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Anonymize Docs — Auteur : Aurélien Moote - Moo - 2026 — Licence MIT
 """
 Pipeline d'anonymisation hybride v2 : Regex + LLM local (Ollama /api/chat)
 Usage CLI  : python anonymize.py <fichier> [--output fichier_sortie.md]
