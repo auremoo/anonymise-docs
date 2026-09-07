@@ -163,7 +163,7 @@ dictionnaire ni aide de la regex** (Regex : 0) :
 
 | Catégorie | Résultat |
 |---|---|
-| Références commerciales (`QU-WIN-123`, `DV2601659`, `24-0871`) | **4/4 taguées** — la regex n'en attrapait aucune |
+| Références commerciales (`DOC-B-123`, `DV2601659`, `24-0871`) | **4/4 taguées** — la regex n'en attrapait aucune |
 | Termes techniques (SCADA, WinCC, OPC UA, Profinet, IEC 61850, B2V, PLC, IHM, VLAN 42, CP343-1) | **11/13 préservés** |
 | Références de procédure (`PR-QSE-07`, `REF-INT-2024-88`) | **laissées en clair** |
 | `S7-1500` | → `[ENTREPRISE_1]-1500` : « S7 » tagué comme société, référence mutilée |
@@ -173,7 +173,7 @@ Le LLM apporte donc une vraie valeur sur les références que la regex ne
 peut pas décrire, mais il se trompe dans les deux sens. `TGBT` remplacé
 en entier n'est **détectable par aucun contrôle** — seule la relecture
 l'attrape. Conclusion inchangée : les familles de références connues
-vont dans le dictionnaire avec un joker (`QU-*`, `DV*`, `PR-*`).
+vont dans le dictionnaire avec un joker (`DOC-*`, `PR-*`, `CAPA-*`).
 
 ### Effet de la taille de chunk (mistral, même document)
 
@@ -219,6 +219,7 @@ une table de relations vide (aucun placeholder émis).
 | Rejet d'intégrité | Réponse LLM hors de 60–130 % de la taille d'entrée → chunk d'origine conservé et signalé (attrape la réécriture/troncature) |
 | Vocabulaire de tags | `check_tag_vocabulary()` — catégorie inventée (`[MARQUE_TECHNIQUE_1]`…) = sur-anonymisation de termes techniques |
 | Tags collés | `check_tags_colles()` — un tag suivi d'un fragment (`[ENTREPRISE_1]-1500`) révèle que le LLM n'a tagué qu'une partie d'une référence technique. La catégorie étant légitime, c'est le seul signal disponible |
+| Entrées ignorées | `entrees_ignorees()` — motif à joker trop large, écarté et signalé dans les avertissements |
 | Fragments numériques | `check_fragments_numeriques()` — un nombre isolé après un tag (`[REF_1] 123`) peut être la fin d'une référence coupée par un espace insécable. Signal moins sûr : formulé comme une vérification |
 | Chunks non traités | Timeout ou Ollama absent → portion restée en clair, avertissement en tête des warnings |
 
@@ -279,7 +280,7 @@ motifs et les mots du dictionnaire.
 | `QU‐WIN‐123`, `QU‑WIN‑123`, `QU−WIN−123` | extraction PDF | tirets → `-` |
 | Espace insécable, fine, largeur nulle | docx/pdf | → espace ou supprimé |
 | Trait d'union optionnel (soft hyphen) | Word | supprimé |
-| `QU-WIN-
+| `DOC-B-
 123` | référence coupée en fin de ligne | recollé |
 
 La règle de recollage n'agit que si la suite commence par un **chiffre ou
@@ -290,12 +291,12 @@ laissée intacte.
 ### Limites assumées du joker
 
 Deux cas ne sont pas couverts, et le sont volontairement — accepter des
-espaces dans le joker ferait déborder `QU-*` sur le mot suivant, ce qui
+espaces dans le joker ferait déborder `DOC-*` sur le mot suivant, ce qui
 est pire qu'un raté :
 
 | Cas | Résultat | Filet |
 |---|---|---|
-| `QU-WIN 123` (espace insécable **interne**) | `[REF_1] 123` — le numéro reste | avertissement « nombre isolé » |
+| `DOC-B 123` (espace insécable **interne**) | `[REF_1] 123` — le numéro reste | avertissement « nombre isolé » |
 | `QU - WIN - 123` (espaces autour des tirets) | non détecté | aucun |
 
 Ces deux limites sont figées par des tests, pour qu'elles restent connues.
@@ -307,13 +308,38 @@ les lister une par une :
 
 | Entrée | Attrape | Ne franchit pas |
 |---|---|---|
-| `QU-OPE*` | `QU-OPE-1234`, `QU-OPE-5678`, `QU-OPE-1.2` | les espaces, la ponctuation finale |
-| `DV*` | `DV2601659`, `DV2601660` | idem |
+| `DOC-A*` | `DOC-A-1234`, `DOC-A-5678`, `DOC-A-1.2` | les espaces, la ponctuation finale |
+| `B33*` | `B33-77`, `B33-78` | idem |
 
 Chaque occurrence distincte reçoit **son propre tag** (`[REF_1]`,
 `[REF_2]`...), donc les références restent distinguables dans le document
-anonymisé. Un motif dont la partie littérale fait moins de 2 caractères
-(`*`, `a*`) est **ignoré** : il anonymiserait le document entier.
+anonymisé.
+
+### Deux garde-fous, appris en production
+
+**1. Le motif est ancré sur un début de mot** (`\b`). Sans cet ancrage,
+une entrée courte matchait *à l'intérieur* des mots.
+
+**2. Un joker précédé de deux lettres seulement est rejeté.** Cas réel
+sur un document de 300 Ko : l'entrée `QU*`, insensible à la casse,
+taguait le « qu » de mots français courants —
+
+| Mot d'origine | Devenait |
+|---|---|
+| Automati**que** | `Automati[REF_30]` |
+| Cha**que** | `Cha[REF_30]` |
+| Ac**quisition** | `Ac[REF_135]` |
+
+143 occurrences, soit une destruction massive du texte technique.
+
+Un joker est donc accepté si sa partie littérale **contient un chiffre,
+un tiret ou un souligné** (signature d'une référence), **ou fait au moins
+quatre lettres**. `QU*` et `DV*` sont rejetés ; `QU-*`, `B33*`, `CC-*`,
+`CAPA-*`, `ACME*` sont acceptés.
+
+Les entrées rejetées sont **listées dans les avertissements** via
+`entrees_ignorees()` : sans ça, `QU*` semblait active alors qu'elle
+n'anonymisait rien du tout.
 
 ## Tests
 
@@ -321,7 +347,7 @@ anonymisé. Un motif dont la partie littérale fait moins de 2 caractères
 python -m unittest discover -s tests -t .
 ```
 
-91 tests, sans dépendance externe et sans Ollama (les appels LLM sont
+98 tests, sans dépendance externe et sans Ollama (les appels LLM sont
 simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.

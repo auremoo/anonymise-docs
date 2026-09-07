@@ -173,7 +173,7 @@ python anonymize.py big_file.docx --chunk-size 2000
 | `--chunk-size` | `1500` | Max characters per LLM chunk. Smaller = fewer missed entities at the end of a chunk, and faster (attention cost is quadratic) |
 | `--passes` | `2` | LLM passes: 1, 2, or 3 |
 | `--timeout` | `300` | Timeout per Ollama request (seconds) |
-| `--dict` | `sensitive-words.json` | Persistent dictionary of sensitive words (JSON). Case-insensitive; `*` acts as a wildcard (`QU-OPE*` covers `QU-OPE-1234`, `QU-OPE-5678`...) |
+| `--dict` | `sensitive-words.json` | Persistent dictionary of sensitive words (JSON). Case-insensitive; `*` acts as a wildcard (`DOC-A*` covers `DOC-A-1234`, `DOC-A-5678`...) |
 | `--parallel` | `3` | Chunks sent to Ollama concurrently. Only helps if `OLLAMA_NUM_PARALLEL` > 1 server-side |
 
 In the web interface, the dictionary can also be edited as raw JSON
@@ -385,12 +385,19 @@ avoir à les lister :
 
 | Entrée | Attrape |
 |---|---|
-| `QU-OPE*` | `QU-OPE-1234`, `QU-OPE-5678`, `QU-OPE-1.2` |
-| `DV*` | `DV2601659`, `DV2601660` |
+| `DOC-A*` | `DOC-A-1234`, `DOC-A-5678`, `DOC-A-1.2` |
+| `B33*` | `B33-77`, `B33-78` |
 
 Le joker ne franchit ni les espaces ni la ponctuation finale, et chaque
 référence reçoit son propre tag (`[REF_1]`, `[REF_2]`...) pour rester
-distinguable. Un motif trop large (`*`, `a*`) est ignoré.
+distinguable.
+
+Le motif est **ancré sur un début de mot**, et un joker précédé de deux
+lettres seulement est **rejeté puis signalé** dans les avertissements.
+Sans ces deux règles, une entrée comme `QU*` taguait le « qu » à
+l'intérieur des mots français : `Automatique` devenait
+`Automati[REF_30]`. Un préfixe est accepté s'il contient un chiffre, un
+tiret ou un souligné, ou s'il fait au moins quatre lettres.
 
 Le dictionnaire est **insensible à la casse** : `NEXANS`, `nexans` et
 `Nexans` donnent le même tag.
@@ -404,7 +411,7 @@ format est celui du fichier :
 {
   "ENTREPRISE": ["Nexans", "Sogetrel"],
   "PERSONNE": ["Jean Dupont"],
-  "REF": ["QU-OPE*"]
+  "REF": ["DOC-A*"]
 }
 ```
 
@@ -416,12 +423,12 @@ le dictionnaire existant.
 Le texte est normalisé à la lecture : les tirets unicode posés par Word
 (`QU–WIN–123`) ou par l'extraction PDF (`QU‐WIN‐123`), les espaces
 insécables, les traits d'union optionnels et les références coupées en
-fin de ligne (`QU-WIN-
+fin de ligne (`DOC-B-
 123`) sont ramenés à leur forme ASCII. Sans
-cela, `QU-*` les laissait passer silencieusement.
+cela, `DOC-*` les laissait passer silencieusement.
 
 Deux cas restent hors de portée du joker, volontairement : un espace
-insécable **à l'intérieur** de la référence (`QU-WIN 123`, signalé par un
+insécable **à l'intérieur** de la référence (`DOC-B 123`, signalé par un
 avertissement) et des espaces autour des tirets (`QU - WIN - 123`).
 Accepter des espaces dans le joker le ferait déborder sur le mot suivant.
 
@@ -466,7 +473,7 @@ identifie un client aussi sûrement qu'un nom.
 python -m unittest discover -s tests -t .
 ```
 
-91 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
+98 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 

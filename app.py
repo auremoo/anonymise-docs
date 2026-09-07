@@ -66,25 +66,27 @@ TEXTS = {
     },
     "custom_words_caption": {
         "FR": "Ajoutez des mots/noms spécifiques à remplacer en priorité "
-              "(avant regex et LLM). Insensible à la casse. `*` = joker "
-              "(`QU-OPE*` couvre toute la série). **C'est la seule passe "
-              "fiable à 100 %** : mettez-y vos clients, sites et collègues "
-              "récurrents.",
+              "(avant regex et LLM). Insensible à la casse. **C'est la "
+              "seule passe fiable à 100 %** : mettez-y vos clients, sites "
+              "et collègues récurrents.",
         "EN": "Add specific words/names to replace first "
-              "(before regex and LLM). Case-insensitive. `*` = wildcard "
-              "(`QU-OPE*` covers the whole series). **This is the only "
-              "100 % reliable pass** — put your recurring clients, sites "
-              "and colleagues here.",
+              "(before regex and LLM). Case-insensitive. **This is the "
+              "only 100 % reliable pass** — put your recurring clients, "
+              "sites and colleagues here.",
     },
     "col_word": {"FR": "Mot / Nom", "EN": "Word / Name"},
     "col_category": {"FR": "Catégorie", "EN": "Category"},
     "col_word_help": {
         "FR": "Le mot ou nom à anonymiser (ex: Jean Dupont, Acme Corp). "
-              "Insensible à la casse. Le caractère * sert de joker : "
-              "QU-OPE* couvre QU-OPE-1234, QU-OPE-5678...",
+              "Insensible à la casse. Le caractère * sert de joker pour "
+              "couvrir une série de références d'un coup. Le préfixe doit "
+              "contenir un tiret ou un chiffre, ou faire au moins quatre "
+              "lettres, sinon il matcherait des mots courants.",
         "EN": "The word or name to anonymize (e.g. John Doe, Acme Corp). "
-              "Case-insensitive. Use * as a wildcard: QU-OPE* covers "
-              "QU-OPE-1234, QU-OPE-5678...",
+              "Case-insensitive. Use * as a wildcard to cover a whole "
+              "series of references at once. The prefix must contain a "
+              "hyphen or a digit, or be at least four letters long, "
+              "otherwise it would match common words.",
     },
     "col_category_help": {
         "FR": "Type d'entité",
@@ -138,6 +140,18 @@ TEXTS = {
     "btn_anonymize": {"FR": "Anonymiser", "EN": "Anonymize"},
     "btn_stop": {"FR": "Arrêter", "EN": "Stop"},
     "starting": {"FR": "Démarrage...", "EN": "Starting..."},
+    "reading": {
+        "FR": "Lecture du document (extraction du texte et des images)...",
+        "EN": "Reading document (extracting text and images)...",
+    },
+    "cancelling": {
+        "FR": "Arrêt demandé — le bloc en cours doit d'abord revenir "
+              "d'Ollama, cela peut prendre plusieurs minutes. "
+              "Inutile de recliquer.",
+        "EN": "Stop requested — the chunk already sent to Ollama must "
+              "come back first, which can take several minutes. "
+              "No need to click again.",
+    },
     "running": {
         "FR": "Anonymisation en cours...",
         "EN": "Anonymization in progress...",
@@ -352,12 +366,11 @@ if "pipe" not in st.session_state:
         "error": None,
         "msg": "",
         "pct": 0.0,
+        "cancelling": False,
+        "original_text": None,
+        "images": [],
     }
 
-if "original_text" not in st.session_state:
-    st.session_state.original_text = None
-if "images_data" not in st.session_state:
-    st.session_state.images_data = None
 if "cancel_flag" not in st.session_state:
     st.session_state.cancel_flag = threading.Event()
 if "lang" not in st.session_state:
@@ -374,8 +387,11 @@ pipe = st.session_state.pipe
 
 with st.sidebar:
     # Language toggle
+    # Libellé en texte plutôt qu'un globe : l'icône suggérait une
+    # connexion réseau, à contresens d'un outil dont tout le traitement
+    # est local. Non traduit, puisque c'est le sélecteur de langue.
     lang = st.radio(
-        "\U0001f310",
+        "Langue / Language",
         ["FR", "EN"],
         index=0 if st.session_state.lang == "FR" else 1,
         horizontal=True,
@@ -662,12 +678,18 @@ with btn_col1:
 with btn_col2:
     stop_clicked = st.button(
         f"\U0001f6d1 {t('btn_stop')}",
-        disabled=not pipe["running"],
+        # Désactivé dès que l'arrêt est demandé : recliquer ne servait à
+        # rien et donnait l'impression que le bouton ne marchait pas.
+        disabled=not pipe["running"] or pipe.get("cancelling", False),
         width="stretch",
     )
 
 if stop_clicked:
     st.session_state.cancel_flag.set()
+    # L'annulation est vérifiée ENTRE les chunks : le chunk déjà parti
+    # chez Ollama doit d'abord revenir. Sans ce marqueur, le clic semblait
+    # sans effet pendant plusieurs minutes et l'utilisateur recliquait.
+    pipe["cancelling"] = True
 
 # ── Start pipeline (background thread) ──────────────────────
 
@@ -676,10 +698,14 @@ if run_clicked:
     pipe["running"] = True
     pipe["result"] = None
     pipe["error"] = None
-    pipe["msg"] = t("starting")
+    # Message posé AVANT le rerun : la barre de progression affiche donc
+    # déjà quelque chose au premier rendu, au lieu d'un écran figé.
+    pipe["msg"] = t("reading")
     pipe["pct"] = 0.0
+    pipe["cancelling"] = False
+    pipe["original_text"] = None
+    pipe["images"] = []
 
-    st.session_state.images_data = None
     st.session_state.cancel_flag = threading.Event()
 
     # Prepare custom words
@@ -690,40 +716,26 @@ if run_clicked:
         if word:
             custom_words[word] = cat
 
-    # Read file + extract images
-    try:
-        file_bytes = uploaded_file.getvalue()
-        if extract_imgs:
-            text, images = read_file_bytes_with_images(
-                file_bytes, uploaded_file.name,
-            )
-        else:
-            text = read_file_bytes(file_bytes, uploaded_file.name)
-            images = []
-    except Exception as e:
-        st.error(f"{t('read_error')}{e}")
-        pipe["running"] = False
-        st.stop()
-
-    st.session_state.original_text = text
-    st.session_state.images_data = images
     filename_stem = Path(uploaded_file.name).stem
     st.session_state.filename_stem = filename_stem
-    images_folder = f"{filename_stem}_images" if images else ""
 
     # Capture references for the thread (no st.session_state access)
     _pipe = pipe
     _cancel_flag = st.session_state.cancel_flag
-    _text = text
+    # Les octets sont déjà en mémoire ; le décodage (docx/pdf, extraction
+    # des images) se fait dans le thread, sinon il bloquait le script
+    # avant le rerun et l'interface restait muette plusieurs secondes.
+    _file_bytes = uploaded_file.getvalue()
     _filename = uploaded_file.name
+    _extract_imgs = extract_imgs
     _custom_words = custom_words if custom_words else None
     _use_llm = not no_llm
     _model = selected_model
     _passes = passes
-    _images = images
-    _images_folder = images_folder
     _filename_stem = filename_stem
     _deep_analysis = deep_analysis
+    _lecture_label = t("reading")
+    _erreur_lecture_label = t("read_error")
 
     def on_progress(message: str, percent: float):
         _pipe["msg"] = message
@@ -731,6 +743,25 @@ if run_clicked:
 
     def run_in_thread():
         try:
+            # ── Lecture du document ──
+            on_progress(_lecture_label, 0.0)
+            try:
+                if _extract_imgs:
+                    _text, _images = read_file_bytes_with_images(
+                        _file_bytes, _filename,
+                    )
+                else:
+                    _text = read_file_bytes(_file_bytes, _filename)
+                    _images = []
+            except Exception as e:
+                # Cause la plus fréquente : format non géré ou fichier
+                # corrompu. Mérite un message lisible, pas une trace.
+                _pipe["error"] = f"{_erreur_lecture_label}{e}"
+                return
+            _pipe["original_text"] = _text
+            _pipe["images"] = _images
+            _images_folder = f"{_filename_stem}_images" if _images else ""
+
             result = run_pipeline(
                 text=_text,
                 filename=_filename,
@@ -778,11 +809,14 @@ if run_clicked:
 
 if pipe["running"]:
     progress_container = st.empty()
+    avertissement_arret = st.empty()
+    if pipe.get("cancelling"):
+        avertissement_arret.warning(t("cancelling"))
     while pipe["running"]:
         msg = pipe["msg"] or t("starting")
         pct = pipe["pct"]
         progress_container.progress(min(max(pct, 0.0), 1.0), text=msg)
-        time.sleep(0.5)
+        time.sleep(0.3)
     # Pipeline finished — brief display of final state
     if st.session_state.cancel_flag.is_set():
         progress_container.progress(1.0, text=t("cancelled"))
@@ -802,7 +836,7 @@ if pipe["error"]:
 if pipe["result"] is not None:
     result = pipe["result"]
     stats = result["stats"]
-    images = st.session_state.images_data or []
+    images = pipe.get("images") or []
 
     st.divider()
     st.subheader(t("results_title"))
@@ -873,7 +907,7 @@ if pipe["result"] is not None:
     with tab_before:
         st.text_area(
             t("tab_before"),
-            value=st.session_state.original_text or "",
+            value=pipe.get("original_text") or "",
             height=400,
             disabled=True,
             label_visibility="collapsed",

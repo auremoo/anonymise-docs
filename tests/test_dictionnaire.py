@@ -118,9 +118,21 @@ class TestJoker(unittest.TestCase):
         self.assertEqual(r["text"].count("[REF_1]"), 2)
         self.assertEqual(len(r["mapping"]), 2)
 
-    def test_prefixe_de_deux_caracteres(self):
-        r = self.anonymiser("DV*", "Devis DV2601659 et DV2601660 recus.")
-        self.assertNotIn("DV26", r["text"])
+    def test_prefixe_court_avec_tiret_accepte(self):
+        """Deux lettres suffisent si le préfixe contient un tiret ou un
+        chiffre : c'est la signature d'une référence, pas d'un mot."""
+        r = self.anonymiser("DV-*", "Devis DV-2601659 et DV-2601660 recus.")
+        self.assertNotIn("2601659", r["text"])
+        self.assertEqual(len(r["mapping"]), 2)
+
+    def test_prefixe_avec_chiffre_accepte(self):
+        r = self.anonymiser("B33*", "Lot B33-77 et B33-78.")
+        self.assertNotIn("B33-77", r["text"])
+        self.assertEqual(len(r["mapping"]), 2)
+
+    def test_prefixe_de_quatre_lettres_accepte(self):
+        r = self.anonymiser("ACME*", "Les societes ACMEA et ACMEB.")
+        self.assertNotIn("ACMEA", r["text"])
         self.assertEqual(len(r["mapping"]), 2)
 
     def test_ponctuation_finale_preservee(self):
@@ -196,6 +208,58 @@ class TestJokerTypographie(unittest.TestCase):
         from anonymize import normaliser_texte
         self.assertEqual(normaliser_texte("exploi-\ntation"),
                          "exploi-\ntation")
+
+
+class TestJokerTropLarge(unittest.TestCase):
+    """Bug observé en production : « QU* » au dictionnaire, insensible à la
+    casse et sans ancrage, taguait le « qu » à l'intérieur des mots
+    français — « Automatique » → « Automati[REF_30] », sur 143
+    occurrences d'un document réel. Deux corrections : ancrage sur un
+    début de mot, et rejet des jokers précédés de deux lettres seulement.
+    """
+
+    def anonymiser(self, motif, texte):
+        return run_pipeline(text=texte, filename="t",
+                            custom_words={motif: "REF"},
+                            use_llm=False, verbose=False)
+
+    PHRASE = ("Le systeme Automatique bloque Chaque acquisition "
+              "et la qualite de QU-OPE-2558404.")
+
+    def test_joker_de_deux_lettres_est_ignore(self):
+        r = self.anonymiser("QU*", self.PHRASE)
+        for mot in ("Automatique", "bloque", "Chaque", "acquisition",
+                    "qualite"):
+            self.assertIn(mot, r["text"], mot)
+
+    def test_entree_ignoree_est_signalee(self):
+        """Sans avertissement, l'entrée semblait active alors qu'elle
+        n'anonymisait rien."""
+        r = self.anonymiser("QU*", self.PHRASE)
+        self.assertTrue(any("IGNORÉE" in w for w in r["warnings"]),
+                        r["warnings"])
+        self.assertTrue(any("QU*" in w for w in r["warnings"]))
+
+    def test_meme_prefixe_avec_tiret_fonctionne(self):
+        """La correction à appliquer : « QU-* » au lieu de « QU* »."""
+        r = self.anonymiser("QU-*", self.PHRASE)
+        self.assertIn("Automatique", r["text"])
+        self.assertIn("acquisition", r["text"])
+        self.assertNotIn("QU-OPE-2558404", r["text"])
+        self.assertEqual(r["warnings"], [])
+
+    def test_ancrage_sur_debut_de_mot(self):
+        """Même un préfixe accepté ne doit pas matcher en milieu de mot."""
+        r = self.anonymiser("CAPA-*", "La CAPA-12 et le mot RECAPA-99.")
+        self.assertIn("RECAPA-99", r["text"])
+        self.assertNotIn("CAPA-12", r["text"])
+
+    def test_liste_des_entrees_ignorees(self):
+        from anonymize import entrees_ignorees
+        self.assertEqual(
+            entrees_ignorees({"QU*": "REF", "DV*": "REF", "QU-*": "REF",
+                              "B33*": "REF", "Nexans": "ENTREPRISE"}),
+            ["DV*", "QU*"])
 
 
 class TestJokerLimites(unittest.TestCase):

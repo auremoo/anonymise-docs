@@ -216,19 +216,54 @@ _MIN_LITTERAL = 2
 def _motif_mot(mot: str) -> str:
     """Traduit un mot du dictionnaire en motif regex.
 
-    Tout est échappé, sauf `*` qui devient un joker. Permet de couvrir une
-    série de références internes ("QU-OPE*" pour QU-OPE-1234, QU-OPE-5678)
+    Tout est échappé, sauf `*` qui devient un joker, ce qui permet de
+    couvrir une série de références ("DOC-A*" pour DOC-A-1234, DOC-A-5678)
     sans les lister une par une. Chaque occurrence distincte reçoit son
     propre tag, donc les références restent distinguables.
+
+    Le motif est ancré sur un **début de mot** : sans cela, une entrée
+    courte matchait à l'intérieur des mots. Observé en production avec
+    « QU* » qui, insensible à la casse, taguait le « qu » de
+    « Automatique » → « Automati[REF_30] », sur 143 occurrences.
     """
-    return _JOKER.join(re.escape(p) for p in mot.split("*"))
+    corps = _JOKER.join(re.escape(p) for p in mot.split("*"))
+    # \b n'a de sens que si le motif commence par un caractère de mot.
+    if mot[:1].isalnum() or mot.startswith("_"):
+        return r"\b" + corps
+    return corps
 
 
 def _motif_assez_precis(mot: str) -> bool:
-    """Rejette les motifs trop larges ("*", "a*") qui videraient le texte."""
+    """Un motif à joker est-il assez discriminant pour être utilisé ?
+
+    Un joker précédé de deux lettres seulement ("QU*", "DV*") désigne des
+    centaines de mots courants — c'est une anonymisation massive du texte,
+    pas un ciblage de références. On exige donc soit un caractère non
+    alphabétique dans la partie littérale (chiffre, tiret, souligné :
+    signature d'une référence), soit au moins quatre lettres.
+    """
     if "*" not in mot:
         return True
-    return len(mot.replace("*", "")) >= _MIN_LITTERAL
+    litteral = mot.replace("*", "")
+    if len(litteral) < _MIN_LITTERAL:
+        return False
+    if any(not c.isalpha() for c in litteral):
+        return True
+    return len(litteral) >= 4
+
+
+def entrees_ignorees(custom_words: dict[str, str] | None) -> list[str]:
+    """Entrées du dictionnaire écartées car trop larges.
+
+    Renvoyées pour être signalées : sans ça, une entrée comme « QU* »
+    semblait active alors qu'elle ne faisait rien du tout.
+    """
+    if not custom_words:
+        return []
+    return sorted(
+        m.strip() for m in custom_words
+        if m.strip() and not _motif_assez_precis(m.strip())
+    )
 
 
 def apply_custom_words(
@@ -1384,6 +1419,16 @@ def run_pipeline(
             "en clair et peuvent encore contenir des noms, sociétés ou lieux. "
             "NE PAS partager ce document sans relecture — augmentez --timeout "
             "ou utilisez un modèle plus léger."
+        ))
+    ignorees = entrees_ignorees(custom_words)
+    if ignorees:
+        warnings.insert(0, (
+            f"⚠️ {len(ignorees)} entrée(s) du dictionnaire IGNORÉE(S) car "
+            "trop large(s) : " + ", ".join(f"« {m} »" for m in ignorees)
+            + ". Un joker précédé de deux lettres seulement matcherait des "
+            "mots courants (« QU* » taguait le « qu » de « Automatique »). "
+            "Ajoutez un tiret ou un chiffre (« QU-* ») ou allongez le "
+            "préfixe. Ces entrées n'ont RIEN anonymisé."
         ))
     if log.stats.get("llm_rejets", 0) > 0:
         warnings.insert(0, (
