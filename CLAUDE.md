@@ -67,6 +67,7 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | File uploader | Drag & drop de documents (disabled pendant l'exécution) |
 | Data editor | Tableau dynamique de mots custom à anonymiser (pré-rempli depuis `sensitive-words.json`) |
 | Save dictionary | Bouton pour sauvegarder les mots custom dans `sensitive-words.json` |
+| Éditeur JSON | Expander pour éditer/coller le dictionnaire en bloc — bien plus rapide que la saisie ligne par ligne. Validation stricte : un JSON mal formé est refusé sans écraser le fichier existant |
 | Image extraction | Checkbox pour activer l'extraction d'images docx/pdf |
 | Progress bar | Callback `on_progress` depuis `run_pipeline()` avec timer |
 | Stop button | Met `cancel_flag.set()`, pipeline s'arrête entre les chunks |
@@ -263,7 +264,7 @@ anonymisé. Un motif dont la partie littérale fait moins de 2 caractères
 python -m unittest discover -s tests -t .
 ```
 
-72 tests, sans dépendance externe et sans Ollama (les appels LLM sont
+79 tests, sans dépendance externe et sans Ollama (les appels LLM sont
 simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.
@@ -274,6 +275,7 @@ document sensible par accident.
 | `test_dictionnaire.py` | Passe 0 — casse, joker `*`, tags fantômes, fichier de dictionnaire |
 | `test_extraction.py` | docx/pdf — correspondance placeholder ↔ fichier vérifiée **par la couleur des pixels** (un simple comptage ne détecte pas un décalage de numérotation) |
 | `test_garde_fous.py` | Rejet d'intégrité, catégories inventées, chunks non traités, annulation, ordre des chunks en parallèle |
+| `test_interface_json.py` | Éditeur JSON de l'UI, exécuté via `AppTest` de Streamlit (saisie → clic → écriture → relecture) |
 
 `run_pipeline(..., verbose=False)` coupe l'affichage console tout en
 gardant le journal complet dans le rapport.

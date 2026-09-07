@@ -191,6 +191,45 @@ TEXTS = {
         "FR": "mot(s) chargé(s) depuis le dictionnaire",
         "EN": "word(s) loaded from dictionary",
     },
+    "json_editor_title": {
+        "FR": "Éditer le dictionnaire en JSON (saisie rapide)",
+        "EN": "Edit the dictionary as JSON (bulk entry)",
+    },
+    "json_editor_caption": {
+        "FR": "Format : `{\"CATEGORIE\": [\"mot1\", \"mot2\"]}`. Plus rapide "
+              "que le tableau pour saisir ou coller beaucoup d'entrées. "
+              "« Appliquer » enregistre dans `sensitive-words.json` **et** "
+              "met le tableau à jour.",
+        "EN": "Format: `{\"CATEGORY\": [\"word1\", \"word2\"]}`. Faster than "
+              "the table for entering or pasting many entries. "
+              "\"Apply\" saves to `sensitive-words.json` **and** refreshes "
+              "the table.",
+    },
+    "json_editor_label": {
+        "FR": "Dictionnaire JSON",
+        "EN": "JSON dictionary",
+    },
+    "json_apply": {
+        "FR": "Appliquer et enregistrer",
+        "EN": "Apply and save",
+    },
+    "json_applied": {
+        "FR": "Dictionnaire enregistré",
+        "EN": "Dictionary saved",
+    },
+    "json_words": {"FR": "mot(s)", "EN": "word(s)"},
+    "json_invalid": {
+        "FR": "JSON invalide —",
+        "EN": "Invalid JSON —",
+    },
+    "json_from_table": {
+        "FR": "Reprendre le tableau",
+        "EN": "Load from table",
+    },
+    "json_from_table_help": {
+        "FR": "Remplace le JSON ci-dessus par le contenu actuel du tableau",
+        "EN": "Replace the JSON above with the table's current content",
+    },
     "deep_analysis": {
         "FR": "Analyse approfondie",
         "EN": "Deep analysis",
@@ -202,6 +241,55 @@ TEXTS = {
               "but slower",
     },
 }
+
+
+def _grouper_par_categorie(mots: dict[str, str]) -> dict[str, list[str]]:
+    """{mot: catégorie} -> {"CATEGORIE": ["mot", ...]}.
+
+    Même format que le fichier `sensitive-words.json`, pour que ce qui est
+    affiché dans l'éditeur soit exactement ce qui est enregistré.
+    """
+    groupes: dict[str, list[str]] = {}
+    for mot, cat in sorted(mots.items()):
+        groupes.setdefault((cat or "PERSONNE").upper(), []).append(mot)
+    return groupes
+
+
+def _valider_json_dico(texte: str):
+    """Valide le JSON saisi. Renvoie (True, {mot: cat}) ou (False, erreur).
+
+    La validation est stricte : un dictionnaire mal formé remplacerait
+    silencieusement la seule passe fiable du pipeline.
+    """
+    if not texte.strip():
+        return True, {}
+    try:
+        data = json.loads(texte)
+    except json.JSONDecodeError as e:
+        return False, f"ligne {e.lineno}, colonne {e.colno} : {e.msg}"
+    if not isinstance(data, dict):
+        return False, "l'objet racine doit être un dictionnaire {…}"
+
+    mots: dict[str, str] = {}
+    for categorie, liste in data.items():
+        if not isinstance(categorie, str) or not categorie.strip():
+            return False, f"catégorie invalide : {categorie!r}"
+        if isinstance(liste, str):
+            return False, (
+                f"« {categorie} » doit contenir une liste, "
+                f"pas un texte : [\"{liste}\"] ?"
+            )
+        if not isinstance(liste, list):
+            return False, f"« {categorie} » doit contenir une liste [...]"
+        for element in liste:
+            if not isinstance(element, str):
+                return False, (
+                    f"« {categorie} » contient une valeur non textuelle : "
+                    f"{element!r}"
+                )
+            if element.strip():
+                mots[element.strip()] = categorie.strip().upper()
+    return True, mots
 
 
 @st.cache_data(ttl=15, show_spinner=False)
@@ -402,19 +490,100 @@ edited_df = st.data_editor(
     disabled=pipe["running"],
 )
 
+def _mots_du_tableau() -> dict[str, str]:
+    """Lignes non vides du tableau -> {mot: catégorie}."""
+    mots = {}
+    for _, row in edited_df.iterrows():
+        mot = str(row[col_word]).strip()
+        cat = str(row[col_cat]).strip()
+        if mot and mot.lower() != "nan":
+            mots[mot] = cat or "PERSONNE"
+    return mots
+
+
+def _recharger_tableau(mots: dict[str, str]):
+    """Remplace le contenu du tableau et force son rafraîchissement.
+
+    L'état du widget `data_editor` doit être purgé, sinon Streamlit
+    réapplique les modifications précédentes par-dessus les nouvelles
+    données.
+    """
+    lignes = [{col_word: m, col_cat: c} for m, c in mots.items()]
+    if not lignes:
+        lignes = [{col_word: "", col_cat: "PERSONNE"}]
+    st.session_state.custom_words_df = pd.DataFrame(
+        lignes, columns=[col_word, col_cat],
+    )
+    st.session_state.pop("custom_editor", None)
+
+
 # Save dictionary button
 if st.button(
     f"\U0001f4be {t('btn_save_dict')}",
     disabled=pipe["running"],
 ):
-    words_to_save = {}
-    for _, row in edited_df.iterrows():
-        word = str(row[col_word]).strip()
-        cat = str(row[col_cat]).strip()
-        if word:
-            words_to_save[word] = cat
+    words_to_save = _mots_du_tableau()
     save_sensitive_words(words_to_save)
     st.success(f"{t('dict_saved')} ({len(words_to_save)} mots)")
+
+# ── Édition directe du JSON ──────────────────────────────────
+# Saisir des dizaines d'entités ligne par ligne dans le tableau est lent :
+# l'éditeur JSON permet un copier-coller en bloc.
+
+with st.expander(f"\U0001f4dd {t('json_editor_title')}"):
+    st.caption(t("json_editor_caption"))
+
+    if "json_dico_texte" not in st.session_state:
+        st.session_state.json_dico_texte = json.dumps(
+            _grouper_par_categorie(load_sensitive_words()),
+            indent=2, ensure_ascii=False,
+        ) or "{}"
+
+    json_texte = st.text_area(
+        t("json_editor_label"),
+        value=st.session_state.json_dico_texte,
+        height=280,
+        key="json_dico_zone",
+        disabled=pipe["running"],
+        label_visibility="collapsed",
+    )
+
+    jc1, jc2 = st.columns(2)
+
+    with jc1:
+        if st.button(
+            f"✅ {t('json_apply')}",
+            disabled=pipe["running"],
+            width="stretch",
+        ):
+            ok, resultat = _valider_json_dico(json_texte)
+            if not ok:
+                st.error(f"{t('json_invalid')} {resultat}")
+            else:
+                save_sensitive_words(resultat)
+                st.session_state.json_dico_texte = json.dumps(
+                    _grouper_par_categorie(resultat),
+                    indent=2, ensure_ascii=False,
+                )
+                _recharger_tableau(resultat)
+                st.success(
+                    f"{t('json_applied')} — "
+                    f"{len(resultat)} {t('json_words')}"
+                )
+                st.rerun()
+
+    with jc2:
+        if st.button(
+            f"\U0001f504 {t('json_from_table')}",
+            disabled=pipe["running"],
+            width="stretch",
+            help=t("json_from_table_help"),
+        ):
+            st.session_state.json_dico_texte = json.dumps(
+                _grouper_par_categorie(_mots_du_tableau()),
+                indent=2, ensure_ascii=False,
+            )
+            st.rerun()
 
 # ── Options ──────────────────────────────────────────────────
 

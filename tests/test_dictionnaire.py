@@ -95,6 +95,29 @@ class TestJoker(unittest.TestCase):
         # distinguables dans le document anonymisé.
         self.assertEqual(len(r["mapping"]), 3)
 
+    def test_prefixe_couvrant_plusieurs_familles(self):
+        """"QU-*" doit couvrir QU-WIN-xxx et QU-OPE-xxx d'un coup, sans
+        toucher aux mots courants commençant par QU (QUALITE, QUI) — le
+        tiret du motif suffit à les exclure."""
+        r = self.anonymiser(
+            "QU-*",
+            "Le lot QU-WIN-123 et QU-OPE-456 remplacent QU-DOC-99, "
+            "cf. paragraphe 4. Le terme QUALITE et le mot QUI restent.")
+        for ref in ("QU-WIN", "QU-OPE", "QU-DOC"):
+            self.assertNotIn(ref, r["text"])
+        self.assertIn("QUALITE", r["text"])
+        self.assertIn("QUI", r["text"])
+        self.assertIn("cf. paragraphe 4", r["text"])
+        self.assertEqual(len(r["mapping"]), 3)
+
+    def test_meme_reference_meme_tag(self):
+        """Deux occurrences de la même référence partagent leur tag ; deux
+        références différentes restent distinguables."""
+        r = self.anonymiser(
+            "QU-*", "QU-WIN-123 puis QU-OPE-456 puis QU-WIN-123.")
+        self.assertEqual(r["text"].count("[REF_1]"), 2)
+        self.assertEqual(len(r["mapping"]), 2)
+
     def test_prefixe_de_deux_caracteres(self):
         r = self.anonymiser("DV*", "Devis DV2601659 et DV2601660 recus.")
         self.assertNotIn("DV26", r["text"])

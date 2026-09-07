@@ -173,9 +173,12 @@ python anonymize.py big_file.docx --chunk-size 2000
 | `--chunk-size` | `1500` | Max characters per LLM chunk. Smaller = fewer missed entities at the end of a chunk, and faster (attention cost is quadratic) |
 | `--passes` | `2` | LLM passes: 1, 2, or 3 |
 | `--timeout` | `300` | Timeout per Ollama request (seconds) |
-| `--dict` | `sensitive-words.json` | Persistent dictionary of sensitive words (JSON). Case-insensitive |
-| | | Supports `*` as a wildcard: `QU-OPE*` covers `QU-OPE-1234`, `QU-OPE-5678`... |
+| `--dict` | `sensitive-words.json` | Persistent dictionary of sensitive words (JSON). Case-insensitive; `*` acts as a wildcard (`QU-OPE*` covers `QU-OPE-1234`, `QU-OPE-5678`...) |
 | `--parallel` | `3` | Chunks sent to Ollama concurrently. Only helps if `OLLAMA_NUM_PARALLEL` > 1 server-side |
+
+In the web interface, the dictionary can also be edited as raw JSON
+(faster than the row-by-row table for bulk entry). Invalid JSON is
+rejected without overwriting the existing dictionary.
 
 ### Supported file formats
 
@@ -391,6 +394,22 @@ distinguable. Un motif trop large (`*`, `a*`) est ignoré.
 Le dictionnaire est **insensible à la casse** : `NEXANS`, `nexans` et
 `Nexans` donnent le même tag.
 
+Dans l'interface web, le dictionnaire s'édite aussi **directement en
+JSON** (section « Éditer le dictionnaire en JSON ») : bien plus rapide que
+le tableau ligne par ligne pour saisir ou coller beaucoup d'entrées. Le
+format est celui du fichier :
+
+```json
+{
+  "ENTREPRISE": ["Nexans", "Sogetrel"],
+  "PERSONNE": ["Jean Dupont"],
+  "REF": ["QU-OPE*"]
+}
+```
+
+Un JSON mal formé est refusé avec le détail de l'erreur, **sans écraser**
+le dictionnaire existant.
+
 ## Extraction des images
 
 Le placeholder `[IMAGE_N]` laissé dans le texte et le fichier `IMAGE_N.ext`
@@ -432,7 +451,7 @@ identifie un client aussi sûrement qu'un nom.
 python -m unittest discover -s tests -t .
 ```
 
-72 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
+79 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 
