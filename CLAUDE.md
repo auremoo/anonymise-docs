@@ -44,6 +44,7 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | `_run_llm_pass()` | Helper DRY pour exécuter une passe LLM sur tous les chunks — parallélise les chunks via `parallel` (défaut 3), résultats réordonnés |
 | `apply_custom_words()` | Passe 0 — remplacement de mots saisis par l'utilisateur, en un seul parcours (regex en alternance). Un `*` agit comme joker |
 | `_motif_mot()` | Traduit un mot du dictionnaire en regex : tout est échappé sauf `*` |
+| `normaliser_texte()` | Ramène la typographie docx/pdf à l'ASCII avant toute recherche (tirets unicode, espaces insécables, coupures de ligne) |
 | `load_sensitive_words()` / `save_sensitive_words()` | Chargement/sauvegarde du dictionnaire persistant `sensitive-words.json` |
 | `RegexAnonymizer` | Passe 1 — patterns structurés (IP, email, dates, FQDN, chemins, téléphones, credentials) |
 | `call_ollama_chat()` | Appel Ollama via `/api/chat` avec system prompt — session HTTP réutilisée, `keep_alive: 10m` |
@@ -218,6 +219,7 @@ une table de relations vide (aucun placeholder émis).
 | Rejet d'intégrité | Réponse LLM hors de 60–130 % de la taille d'entrée → chunk d'origine conservé et signalé (attrape la réécriture/troncature) |
 | Vocabulaire de tags | `check_tag_vocabulary()` — catégorie inventée (`[MARQUE_TECHNIQUE_1]`…) = sur-anonymisation de termes techniques |
 | Tags collés | `check_tags_colles()` — un tag suivi d'un fragment (`[ENTREPRISE_1]-1500`) révèle que le LLM n'a tagué qu'une partie d'une référence technique. La catégorie étant légitime, c'est le seul signal disponible |
+| Fragments numériques | `check_fragments_numeriques()` — un nombre isolé après un tag (`[REF_1] 123`) peut être la fin d'une référence coupée par un espace insécable. Signal moins sûr : formulé comme une vérification |
 | Chunks non traités | Timeout ou Ollama absent → portion restée en clair, avertissement en tête des warnings |
 
 Ces trois cas remontent dans `result["warnings"]`, donc dans le rapport,
@@ -263,6 +265,40 @@ Les prompts système sont dans les constantes `SYSTEM_PROMPT_PASS2` et `SYSTEM_P
 - Le rapport doit toujours être généré, même en cas d'erreurs LLM
 - L'annulation via `cancel_flag` doit retourner un résultat partiel cohérent
 
+## Normalisation typographique
+
+`normaliser_texte()` est appliqué **une seule fois**, en entrée de
+`run_pipeline()`, donc couvre le CLI comme l'interface. Sans lui, des
+caractères invisibles à l'œil faisaient échouer silencieusement les
+motifs et les mots du dictionnaire.
+
+| Cas | Origine | Traitement |
+|---|---|---|
+| `QU—WIN—123`, `QU–WIN–123` | correction automatique de Word | tirets → `-` |
+| `QU‐WIN‐123`, `QU‑WIN‑123`, `QU−WIN−123` | extraction PDF | tirets → `-` |
+| Espace insécable, fine, largeur nulle | docx/pdf | → espace ou supprimé |
+| Trait d'union optionnel (soft hyphen) | Word | supprimé |
+| `QU-WIN-
+123` | référence coupée en fin de ligne | recollé |
+
+La règle de recollage n'agit que si la suite commence par un **chiffre ou
+une majuscule** : une césure française ordinaire (`exploi-
+tation`) est
+laissée intacte.
+
+### Limites assumées du joker
+
+Deux cas ne sont pas couverts, et le sont volontairement — accepter des
+espaces dans le joker ferait déborder `QU-*` sur le mot suivant, ce qui
+est pire qu'un raté :
+
+| Cas | Résultat | Filet |
+|---|---|---|
+| `QU-WIN 123` (espace insécable **interne**) | `[REF_1] 123` — le numéro reste | avertissement « nombre isolé » |
+| `QU - WIN - 123` (espaces autour des tirets) | non détecté | aucun |
+
+Ces deux limites sont figées par des tests, pour qu'elles restent connues.
+
 ## Dictionnaire : joker `*`
 
 Un `*` dans un mot du dictionnaire couvre une série de références sans
@@ -284,7 +320,7 @@ anonymisé. Un motif dont la partie littérale fait moins de 2 caractères
 python -m unittest discover -s tests -t .
 ```
 
-82 tests, sans dépendance externe et sans Ollama (les appels LLM sont
+88 tests, sans dépendance externe et sans Ollama (les appels LLM sont
 simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.

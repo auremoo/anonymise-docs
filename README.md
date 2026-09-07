@@ -410,6 +410,20 @@ format est celui du fichier :
 Un JSON mal formé est refusé avec le détail de l'erreur, **sans écraser**
 le dictionnaire existant.
 
+### Typographie
+
+Le texte est normalisé à la lecture : les tirets unicode posés par Word
+(`QU–WIN–123`) ou par l'extraction PDF (`QU‐WIN‐123`), les espaces
+insécables, les traits d'union optionnels et les références coupées en
+fin de ligne (`QU-WIN-
+123`) sont ramenés à leur forme ASCII. Sans
+cela, `QU-*` les laissait passer silencieusement.
+
+Deux cas restent hors de portée du joker, volontairement : un espace
+insécable **à l'intérieur** de la référence (`QU-WIN 123`, signalé par un
+avertissement) et des espaces autour des tirets (`QU - WIN - 123`).
+Accepter des espaces dans le joker le ferait déborder sur le mot suivant.
+
 ## Extraction des images
 
 Le placeholder `[IMAGE_N]` laissé dans le texte et le fichier `IMAGE_N.ext`
@@ -451,7 +465,7 @@ identifie un client aussi sûrement qu'un nom.
 python -m unittest discover -s tests -t .
 ```
 
-82 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
+88 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 

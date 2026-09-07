@@ -786,6 +786,47 @@ def _read_pdf_with_images(data: bytes) -> tuple[str, list[tuple[bytes, str]]]:
     return "\n".join(parts), images
 
 
+# Caractères typographiques que docx et pdf produisent à la place de leurs
+# équivalents ASCII. Invisibles à l'œil, ils font échouer les patterns et
+# les mots du dictionnaire : "QU–WIN–123" (tiret cadratin posé par la
+# correction automatique de Word) n'est pas "QU-WIN-123".
+_SUBSTITUTIONS = {
+    "‐": "-",   # trait d'union unicode (extraction PDF)
+    "‑": "-",   # trait d'union insécable
+    "‒": "-",   # tiret numérique
+    "–": "-",   # tiret demi-cadratin (en dash)
+    "—": "-",   # tiret cadratin (em dash)
+    "―": "-",   # barre horizontale
+    "−": "-",   # signe moins
+    " ": " ",   # espace insécable
+    " ": " ",   # espace insécable fine
+    " ": " ",   # espace fine
+    "​": "",    # espace de largeur nulle
+    "‌": "",    # antiliant
+    "­": "",    # trait d'union optionnel (soft hyphen)
+    "’": "'",   # apostrophe typographique
+    "“": '"',
+    "”": '"',
+}
+
+# Référence coupée en fin de ligne : "QU-WIN-\n123". On ne recolle que si
+# la suite commence par un chiffre ou une majuscule — signature d'une
+# référence, pas d'une césure de mot français ("exploi-\ntation").
+_COUPURE_REFERENCE = re.compile(r"-[ \t]*\n[ \t]*(?=[0-9A-Z])")
+
+
+def normaliser_texte(texte: str) -> str:
+    """Ramène la typographie du document à l'ASCII attendu par les motifs.
+
+    Appliqué à la lecture, donc bénéficie à la passe 0 (dictionnaire), à
+    la passe 1 (regex) et au LLM.
+    """
+    for source, cible in _SUBSTITUTIONS.items():
+        if source in texte:
+            texte = texte.replace(source, cible)
+    return _COUPURE_REFERENCE.sub("-", texte)
+
+
 def read_file(filepath: Path) -> str:
     """Read file as plain text (no image extraction)."""
     suffix = filepath.suffix.lower()
@@ -999,6 +1040,27 @@ def check_tags_colles(text: str) -> list[str]:
     )]
 
 
+def check_fragments_numeriques(text: str) -> list[str]:
+    """Repère un nombre isolé juste après un tag.
+
+    Cas résiduel du joker : dans "QU-WIN 123" (espace insécable venu d'un
+    PDF), le motif "QU-*" ne franchit pas l'espace, donc il produit
+    "[REF_1] 123" et le numéro reste lisible. Contrairement à
+    `check_tags_colles()`, l'espace rend le signal moins sûr : formulé
+    comme une vérification, pas comme une erreur.
+    """
+    trouves = re.findall(r'(\[[A-Z][A-Z_]*_\d+\] \d{2,6})\b', text)
+    if not trouves:
+        return []
+    apercu = ", ".join(f"« {t} »" for t in sorted(set(trouves))[:5])
+    return [(
+        f"À vérifier — {len(set(trouves))} nombre(s) isolé(s) juste après "
+        f"un tag : {apercu}. Ce peut être un nombre légitime, ou la fin "
+        "d'une référence coupée par un espace insécable "
+        "(« QU-WIN 123 » → « [REF_1] 123 »)."
+    )]
+
+
 def post_check(text: str) -> list[str]:
     warnings = []
     ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', text)
@@ -1191,6 +1253,12 @@ def run_pipeline(
     log = Logger(on_progress=on_progress, verbose=verbose)
     log.stats["fichier_source"] = filename
     log.stats["taille_originale"] = len(text)
+
+    # Normalisation typographique avant toute recherche : un tiret
+    # cadratin posé par Word ou un espace insécable venu d'un PDF fait
+    # échouer silencieusement les motifs et les mots du dictionnaire.
+    # Point d'entrée unique, donc couvre le CLI comme l'interface.
+    text = normaliser_texte(text)
     log.stats["images_trouvees"] = images_count
 
     log.log(
@@ -1302,6 +1370,7 @@ def run_pipeline(
         extra={c.upper() for c in (custom_words or {}).values()},
     )
     warnings += check_tags_colles(text)
+    warnings += check_fragments_numeriques(text)
 
     # Un chunk dont l'appel LLM a échoué (timeout, Ollama surchargé) est
     # conservé TEL QUEL : le document de sortie contient alors encore les

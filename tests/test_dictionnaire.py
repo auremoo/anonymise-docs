@@ -153,6 +153,71 @@ class TestJoker(unittest.TestCase):
         r = self.anonymiser("QU-OPE*", "Dossier QU-OPE-1234 ouvert.", "PROJET")
         self.assertIn("[PROJET_1]", r["text"])
 
+class TestJokerTypographie(unittest.TestCase):
+    """docx et pdf remplacent les tirets et espaces ASCII par des
+    variantes unicode invisibles à l'œil, qui faisaient échouer
+    silencieusement les motifs. `normaliser_texte()` les ramène à l'ASCII.
+    """
+
+    def anonymiser(self, texte):
+        return run_pipeline(text=texte, filename="t",
+                            custom_words={"QU-*": "REF"},
+                            use_llm=False, verbose=False)
+
+    def test_variantes_de_tirets_attrapees(self):
+        variantes = {
+            "cadratin (Word)": "QU—WIN—123",
+            "demi-cadratin": "QU–WIN–123",
+            "trait d'union unicode": "QU‐WIN‐123",
+            "trait d'union insécable": "QU‑WIN‑123",
+            "tiret numérique": "QU‒WIN‒123",
+            "signe moins": "QU−WIN−123",
+        }
+        for nom, ref in variantes.items():
+            r = self.anonymiser(f"Le lot {ref} est valide.")
+            self.assertIn("[REF_1]", r["text"], nom)
+            self.assertNotIn("WIN", r["text"], nom)
+            self.assertNotIn("123", r["text"], nom)
+
+    def test_trait_dunion_optionnel_supprime(self):
+        r = self.anonymiser("Le lot QU-WIN­123 est valide.")
+        self.assertNotIn("123", r["text"])
+
+    def test_reference_coupee_en_fin_de_ligne(self):
+        """"QU-WIN-\\n123" doit être recollé : sinon le numéro restait
+        lisible juste après le tag."""
+        r = self.anonymiser("Le lot QU-WIN-\n123 est valide.")
+        self.assertIn("[REF_1]", r["text"])
+        self.assertNotIn("123", r["text"])
+
+    def test_cesure_de_mot_francais_non_recollee(self):
+        """La règle ne recolle que si la suite commence par un chiffre ou
+        une majuscule, pour ne pas fusionner une césure ordinaire."""
+        from anonymize import normaliser_texte
+        self.assertEqual(normaliser_texte("exploi-\ntation"),
+                         "exploi-\ntation")
+
+
+class TestJokerLimites(unittest.TestCase):
+    """Deux cas que le joker ne couvre pas. Figés ici pour qu'ils restent
+    connus : accepter des espaces dans le joker ferait déborder « QU-* »
+    sur le mot suivant, ce qui est pire."""
+
+    def anonymiser(self, texte):
+        return run_pipeline(text=texte, filename="t",
+                            custom_words={"QU-*": "REF"},
+                            use_llm=False, verbose=False)
+
+    def test_espace_insecable_laisse_un_fragment_mais_alerte(self):
+        r = self.anonymiser("Le lot QU-WIN 123 est valide.")
+        self.assertIn("123", r["text"])          # limite assumée
+        self.assertTrue(any("nombre(s) isolé" in w for w in r["warnings"]),
+                        r["warnings"])
+
+    def test_espaces_autour_des_tirets_non_couverts(self):
+        r = self.anonymiser("Le lot QU - WIN - 123 est valide.")
+        self.assertNotIn("[REF_", r["text"])     # limite assumée
+
 
 class TestFichierDictionnaire(unittest.TestCase):
 
