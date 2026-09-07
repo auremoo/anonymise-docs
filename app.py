@@ -319,7 +319,8 @@ DEFAULT_MODEL = "mistral:latest"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 CATEGORIES = [
-    "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "LIEU", "REF", "SECRET",
+    "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "PROCESS",
+    "LIEU", "REF", "SECRET",
 ]
 
 SUPPORTED_EXTENSIONS = [
@@ -533,15 +534,24 @@ if st.button(
 with st.expander(f"\U0001f4dd {t('json_editor_title')}"):
     st.caption(t("json_editor_caption"))
 
-    if "json_dico_texte" not in st.session_state:
-        st.session_state.json_dico_texte = json.dumps(
+    # Un widget qui a une `key` tire sa valeur de
+    # st.session_state[key] et IGNORE le paramètre `value=` aux reruns
+    # suivants. Écrire dans une variable séparée ne changeait donc rien à
+    # l'affichage. Et on ne peut pas écrire dans st.session_state[key]
+    # après la création du widget (Streamlit lève une exception), d'où ce
+    # relais : les boutons déposent la nouvelle valeur dans
+    # `_json_a_appliquer`, consommée ici au run suivant, AVANT le widget.
+    if "_json_a_appliquer" in st.session_state:
+        st.session_state.json_dico_zone = st.session_state.pop(
+            "_json_a_appliquer")
+    elif "json_dico_zone" not in st.session_state:
+        st.session_state.json_dico_zone = json.dumps(
             _grouper_par_categorie(load_sensitive_words()),
             indent=2, ensure_ascii=False,
         ) or "{}"
 
     json_texte = st.text_area(
         t("json_editor_label"),
-        value=st.session_state.json_dico_texte,
         height=280,
         key="json_dico_zone",
         disabled=pipe["running"],
@@ -561,7 +571,9 @@ with st.expander(f"\U0001f4dd {t('json_editor_title')}"):
                 st.error(f"{t('json_invalid')} {resultat}")
             else:
                 save_sensitive_words(resultat)
-                st.session_state.json_dico_texte = json.dumps(
+                # Réaffiche le JSON reformaté (indenté, trié) tel qu'il
+                # vient d'être enregistré.
+                st.session_state._json_a_appliquer = json.dumps(
                     _grouper_par_categorie(resultat),
                     indent=2, ensure_ascii=False,
                 )
@@ -579,10 +591,10 @@ with st.expander(f"\U0001f4dd {t('json_editor_title')}"):
             width="stretch",
             help=t("json_from_table_help"),
         ):
-            st.session_state.json_dico_texte = json.dumps(
+            st.session_state._json_a_appliquer = json.dumps(
                 _grouper_par_categorie(_mots_du_tableau()),
                 indent=2, ensure_ascii=False,
-            )
+            ) or "{}"
             st.rerun()
 
 # ── Options ──────────────────────────────────────────────────

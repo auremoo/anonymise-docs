@@ -76,6 +76,47 @@ class TestEditeurJson(unittest.TestCase):
         self.assertTrue(at.error)
         self.assertFalse(self.dico.exists())
 
+    def test_reprendre_le_tableau_remplace_le_json(self):
+        """Bug signalé : le bouton « Reprendre le tableau » n'avait aucun
+        effet. Un widget muni d'une `key` tire sa valeur de
+        st.session_state[key] et ignore `value=` aux reruns suivants, donc
+        écrire dans une variable séparée ne changeait rien à l'affichage.
+        """
+        at = AppTest.from_file(APP, default_timeout=90).run()
+
+        # On remplit le dictionnaire (et donc le tableau) via le JSON.
+        at.text_area(key="json_dico_zone").set_value(
+            '{"ENTREPRISE": ["Nexans", "Sogetrel"]}')
+        at2 = [b for b in at.button if "Appliquer" in b.label][0].click().run()
+
+        # On saccage le JSON sans l'appliquer, puis on reprend le tableau.
+        at2.text_area(key="json_dico_zone").set_value('{"POUBELLE": ["xxx"]}')
+        at3 = [b for b in at2.button
+               if "Reprendre" in b.label][0].click().run()
+
+        affiche = at3.text_area(key="json_dico_zone").value
+        self.assertNotIn("POUBELLE", affiche)
+        self.assertIn("Nexans", affiche)
+        self.assertIn("Sogetrel", affiche)
+
+    def test_appliquer_reformate_le_json(self):
+        """« Appliquer » doit réafficher le JSON indenté tel qu'enregistré,
+        ce que la même cause empêchait."""
+        at = AppTest.from_file(APP, default_timeout=90).run()
+        at.text_area(key="json_dico_zone").set_value(
+            '{"ENTREPRISE":["Nexans"]}')
+        at2 = [b for b in at.button if "Appliquer" in b.label][0].click().run()
+        self.assertIn("\n", at2.text_area(key="json_dico_zone").value)
+
+    def test_categorie_process_disponible(self):
+        at = AppTest.from_file(APP, default_timeout=90).run()
+        at.text_area(key="json_dico_zone").set_value(
+            '{"PROCESS": ["FLOTTATION-A3"]}')
+        at2 = [b for b in at.button if "Appliquer" in b.label][0].click().run()
+        self.assertEqual(list(at2.error), [])
+        self.assertEqual(anonymize.load_sensitive_words(self.dico),
+                         {"FLOTTATION-A3": "PROCESS"})
+
     def test_editeur_prerempli_depuis_le_fichier(self):
         anonymize.save_sensitive_words(
             {"Nexans": "ENTREPRISE"}, self.dico)

@@ -988,7 +988,7 @@ def split_into_chunks(text: str, max_chars: int = 4000) -> list[str]:
 # liste d'exclusion du prompt protège — et détruit l'intérêt du document.
 TAGS_AUTORISES = {
     "IP", "EMAIL", "TEL", "DATE", "SERVEUR", "CHEMIN", "SECRET", "IMAGE",
-    "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "LIEU", "REF",
+    "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "PROCESS", "LIEU", "REF",
 }
 
 

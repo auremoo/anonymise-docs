@@ -218,6 +218,7 @@ rejected without overwriting the existing dictionary.
 | `[PROJET_n]` | Internal project names | LLM |
 | `[LIEU_n]` | Physical addresses / cities | LLM |
 | `[REF_n]` | Other client references | LLM |
+| `[PROCESS_n]` | Manufacturing processes, recipes (dictionary only) | Dictionary |
 | `[IMAGE_n]` | Image placeholders (docx/pdf) | Extraction |
 
 ## Web interface (Streamlit)
@@ -465,7 +466,7 @@ identifie un client aussi sûrement qu'un nom.
 python -m unittest discover -s tests -t .
 ```
 
-88 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
+91 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 

@@ -100,7 +100,8 @@ class TestVocabulaireDeTags(unittest.TestCase):
         self.assertEqual(
             check_tag_vocabulary(
                 "[PERSONNE_1] chez [ENTREPRISE_2] via [IP_1], [IMAGE_3], "
-                "[REF_1], [SECRET_1], [SITE_2], [PROJET_1], [LIEU_4]"),
+                "[REF_1], [SECRET_1], [SITE_2], [PROJET_1], [LIEU_4], "
+                "[PROCESS_1], [TEL_1], [DATE_1], [SERVEUR_1], [CHEMIN_1]"),
             [])
 
     def test_categories_du_dictionnaire_acceptees(self):

@@ -238,6 +238,7 @@ Format : `[CATEGORIE_N]` avec numérotation séquentielle par catégorie.
 
 **Tags Regex** : `IP`, `EMAIL`, `TEL`, `DATE`, `SERVEUR`, `CHEMIN`, `SECRET`, `REF`
 **Tags LLM** : `PERSONNE`, `ENTREPRISE`, `SITE`, `PROJET`, `LIEU`, `REF`
+**Tags dictionnaire** : les précédents plus `PROCESS` (procédés, recettes, gammes de fabrication) — proposé dans l'UI et accepté par `check_tag_vocabulary()`, mais **non demandé au LLM** : lui faire taguer des procédés reviendrait à supprimer le contexte technique du document.
 **Tags Extraction** : `IMAGE` (placeholders pour images extraites de docx/pdf)
 
 ### Prompts LLM
@@ -320,7 +321,7 @@ anonymisé. Un motif dont la partie littérale fait moins de 2 caractères
 python -m unittest discover -s tests -t .
 ```
 
-88 tests, sans dépendance externe et sans Ollama (les appels LLM sont
+91 tests, sans dépendance externe et sans Ollama (les appels LLM sont
 simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.
