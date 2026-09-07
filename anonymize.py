@@ -17,6 +17,7 @@ import time
 import argparse
 import datetime
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from collections import defaultdict
 from typing import Callable
@@ -47,10 +48,15 @@ except ImportError:
 class Logger:
     """Collecte tous les événements pour le rapport final."""
 
-    def __init__(self, on_progress: Callable[[str, float], None] | None = None):
+    def __init__(self, on_progress: Callable[[str, float], None] | None = None,
+                 verbose: bool = True):
         self.entries = []
         self.start_time = time.time()
         self.on_progress = on_progress
+        # verbose=False : le journal reste collecte (et le rapport complet)
+        # mais rien n'est ecrit sur la console. Utilise par les tests.
+        self.verbose = verbose
+        self._lock = threading.Lock()
         self.stats = {
             "fichier_source": "",
             "taille_originale": 0,
@@ -69,16 +75,23 @@ class Logger:
     def elapsed(self) -> str:
         return f"{time.time() - self.start_time:.0f}s"
 
+    def bump(self, key: str, n: int = 1):
+        """Incremente un compteur de stats (thread-safe)."""
+        with self._lock:
+            self.stats[key] = self.stats.get(key, 0) + n
+
     def log(self, level: str, message: str, progress: float | None = None):
         timestamp = time.time() - self.start_time
         entry = {"t": round(timestamp, 2), "level": level, "msg": message}
-        self.entries.append(entry)
+        with self._lock:
+            self.entries.append(entry)
         # Affichage console
         icons = {"INFO": "📄", "REGEX": "🔍", "CUSTOM": "🏷️", "LLM": "🤖",
                  "VERIF": "🔎", "OK": "✅", "WARN": "⚠️", "ERROR": "❌",
                  "DONE": "✅", "STOP": "🛑", "IMG": "🖼️"}
         icon = icons.get(level, "•")
-        print(f"  {icon} [{timestamp:6.1f}s] {message}")
+        if self.verbose:
+            print(f"  {icon} [{timestamp:6.1f}s] {message}")
         if self.on_progress and progress is not None:
             self.on_progress(f"{message} — {self.elapsed()}", progress)
 
@@ -140,7 +153,8 @@ class Logger:
             for key, tag in sorted(
                 regex_anon.mapping.items(), key=lambda x: x[1]
             ):
-                cat, original = key.split("::", 1)
+                cat, normalise = key.split("::", 1)
+                original = regex_anon.originals.get(tag, normalise)
                 lines.append(f"| `{tag}` | {cat} | `{original}` |")
             lines.append("")
 
@@ -175,7 +189,7 @@ class Logger:
 
         # Log complet
         lines += ["---", "", "## Journal complet", "", "```"]
-        for e in self.entries:
+        for e in sorted(self.entries, key=lambda x: x["t"]):
             lines.append(f"[{e['t']:6.1f}s] [{e['level']:5s}] {e['msg']}")
         lines.append("```")
 
@@ -186,20 +200,81 @@ class Logger:
 # PASSE 0 : Mots personnalisés
 # =============================================================================
 
+# Caractères couverts par le joker `*` d'un mot du dictionnaire.
+# Le joker ne franchit pas les espaces, et il doit **finir** sur un
+# caractère alphanumérique : sinon "QU-OPE*" avalait le point final de la
+# phrase ("QU-OPE-9999." au lieu de "QU-OPE-9999").
+_JOKER = r"(?:[A-Za-z0-9_./\-]*[A-Za-z0-9_])?"
+
+# Nombre minimum de caractères littéraux exigés dans un motif à joker.
+# Sans ce garde-fou, une entrée "*" (faute de frappe) anonymiserait le
+# document entier. Deux caractères suffisent pour des préfixes réels
+# comme "DV*" ou "QU*".
+_MIN_LITTERAL = 2
+
+
+def _motif_mot(mot: str) -> str:
+    """Traduit un mot du dictionnaire en motif regex.
+
+    Tout est échappé, sauf `*` qui devient un joker. Permet de couvrir une
+    série de références internes ("QU-OPE*" pour QU-OPE-1234, QU-OPE-5678)
+    sans les lister une par une. Chaque occurrence distincte reçoit son
+    propre tag, donc les références restent distinguables.
+    """
+    return _JOKER.join(re.escape(p) for p in mot.split("*"))
+
+
+def _motif_assez_precis(mot: str) -> bool:
+    """Rejette les motifs trop larges ("*", "a*") qui videraient le texte."""
+    if "*" not in mot:
+        return True
+    return len(mot.replace("*", "")) >= _MIN_LITTERAL
+
+
 def apply_custom_words(
     text: str,
     custom_words: dict[str, str],
     regex_anon: "RegexAnonymizer",
 ) -> tuple[str, int]:
-    """Remplace les mots custom avant la passe regex."""
-    count = 0
-    for word, category in sorted(custom_words.items(), key=lambda x: -len(x[0])):
-        if not word.strip():
-            continue
-        tag = regex_anon._get_tag(category.upper(), word)
-        text, n = re.subn(re.escape(word), tag, text, flags=re.IGNORECASE)
-        count += n
-    return text, count
+    """Remplace les mots custom avant la passe regex.
+
+    Un `*` dans un mot agit comme un joker : voir `_motif_mot()`.
+
+    Un seul parcours du texte (regex en alternance) au lieu d'un par mot :
+    - une passe sur le texte pour N mots au lieu de N passes ;
+    - un mot court ne peut plus matcher à l'intérieur d'un tag déjà inséré
+      par un mot précédent ;
+    - les mots absents du texte ne créent plus de tag fantôme dans le
+      mapping (avant, tout le dictionnaire s'y retrouvait).
+    """
+    words = [w.strip() for w in custom_words if w.strip()]
+    words = [w for w in words if _motif_assez_precis(w)]
+    if not words:
+        return text, 0
+
+    # Les plus longs d'abord : "Jean Dupont" doit gagner sur "Jean".
+    words.sort(key=len, reverse=True)
+
+    # Un groupe nommé par mot : permet de retrouver la catégorie du mot
+    # qui a matché, y compris quand le motif contient un joker (le texte
+    # capturé n'est alors pas une clé du dictionnaire).
+    categories = {}
+    alternatives = []
+    for i, mot in enumerate(words):
+        nom = f"m{i}"
+        categories[nom] = custom_words.get(
+            mot, next((c for w, c in custom_words.items()
+                       if w.strip() == mot), "PERSONNE"),
+        )
+        alternatives.append(f"(?P<{nom}>{_motif_mot(mot)})")
+    pattern = re.compile("|".join(alternatives), flags=re.IGNORECASE)
+
+    def _replace(match: re.Match) -> str:
+        matched = match.group(0)
+        category = categories.get(match.lastgroup, "PERSONNE")
+        return regex_anon._get_tag(category.upper(), matched)
+
+    return pattern.subn(_replace, text)
 
 
 # =============================================================================
@@ -251,18 +326,38 @@ def save_sensitive_words(
 # PASSE 1 : Regex
 # =============================================================================
 
+def _looks_like_ipv6(candidate: str) -> bool:
+    """Filtre les faux positifs du pattern IPv6.
+
+    "12:30:45" (une heure) ou "1:2:3" matchent le pattern sans être des
+    adresses. Une vraie IPv6 a au moins un groupe contenant une lettre
+    hexadécimale ou faisant 3-4 caractères.
+    """
+    return any(
+        len(g) >= 3 or any(c in "abcdefABCDEF" for c in g)
+        for g in candidate.split(":")
+    )
+
+
 class RegexAnonymizer:
 
     def __init__(self):
         self.counters = defaultdict(int)
         self.mapping = {}
+        # tag → valeur telle qu'écrite dans le document. La clé de `mapping`
+        # est normalisée en minuscules pour dédupliquer les variantes de
+        # casse, ce qui perdait la casse d'origine dans le mapping exporté
+        # (un mot de passe "Sup3rS3cret" y apparaissait "sup3rs3cret").
+        self.originals: dict[str, str] = {}
 
     def _get_tag(self, category: str, original: str) -> str:
         key = f"{category}::{original.strip().lower()}"
         if key not in self.mapping:
             self.counters[category] += 1
             self.mapping[key] = f"[{category}_{self.counters[category]}]"
-        return self.mapping[key]
+        tag = self.mapping[key]
+        self.originals.setdefault(tag, original.strip())
+        return tag
 
     def anonymize(self, text: str) -> str:
         # ── IP v4 ──
@@ -270,10 +365,16 @@ class RegexAnonymizer:
             r'\b(?:(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\.){3}'
             r'(?:25[0-5]|2[0-4]\d|[01]?\d\d?)\b',
             lambda m: self._get_tag("IP", m.group(0)), text)
-        # ── IP v6 ──
+        # ── IP v6 (validée : "12:30:45" n'est pas une IP) ──
         text = re.sub(
             r'\b(?:[0-9a-fA-F]{1,4}:){2,7}[0-9a-fA-F]{1,4}\b',
-            lambda m: self._get_tag("IP", m.group(0)), text)
+            lambda m: self._get_tag("IP", m.group(0))
+            if _looks_like_ipv6(m.group(0)) else m.group(0), text)
+        # ── Email (AVANT le FQDN : sinon le pattern FQDN ne prend que le
+        #    domaine et la partie locale de l'adresse reste en clair) ──
+        text = re.sub(
+            r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',
+            lambda m: self._get_tag("EMAIL", m.group(0)), text)
         # ── FQDN ──
         text = re.sub(
             r'\b[a-zA-Z][a-zA-Z0-9\-]*\.'
@@ -281,16 +382,21 @@ class RegexAnonymizer:
             r'(?:local|lan|internal|corp|intra|net|com|fr|org|eu|io|'
             r'de|uk|it|es)\b',
             lambda m: self._get_tag("SERVEUR", m.group(0)), text)
-        # ── Email ──
-        text = re.sub(
-            r'\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}\b',
-            lambda m: self._get_tag("EMAIL", m.group(0)), text)
         # ── Credentials / connection strings ──
         # Password=xxx, Pwd=xxx, User ID=xxx dans les connection strings
+        # La valeur court jusqu'au ';' d'une connection string, mais en
+        # pleine phrase ("Password=abc, puis redemarrez") elle avalait la
+        # suite du texte. On coupe donc au premier ", " : une valeur de
+        # connection string n'en contient pas, une phrase si.
+        def _secret(m: re.Match) -> str:
+            valeur = m.group(2)
+            coupe = valeur.split(", ")[0].rstrip()
+            reste = valeur[len(coupe):]
+            return m.group(1) + self._get_tag("SECRET", coupe) + reste
+
         text = re.sub(
             r'(?i)((?:Password|Pwd|User\s*ID|Uid)\s*=\s*)([^;"\r\n]+)',
-            lambda m: m.group(1) + self._get_tag("SECRET", m.group(2)),
-            text)
+            _secret, text)
         # Champs JSON sensibles : "ApiKey": "xxx"
         text = re.sub(
             r'(?i)("(?:Password|Pwd|Secret|ApiKey|api_key|Token|'
@@ -308,9 +414,12 @@ class RegexAnonymizer:
             r'\b\d{4}-\d{2}-\d{2}\b',
             lambda m: self._get_tag("DATE", m.group(0)), text)
         # French written dates: "4 février 2026", "1er mars 2025"
+        # Les variantes sans accent (fevrier, aout, decembre) sont acceptées :
+        # l'extraction d'un PDF perd fréquemment les accents.
         text = re.sub(
-            r'\b\d{1,2}(?:er)?\s+(?:janvier|février|mars|avril|mai|juin|'
-            r'juillet|août|septembre|octobre|novembre|décembre)\s+\d{4}\b',
+            r'\b\d{1,2}(?:er)?\s+(?:janvier|f[ée]vrier|mars|avril|mai|juin|'
+            r'juillet|ao[ûu]t|septembre|octobre|novembre|d[ée]cembre)'
+            r'\s+\d{4}\b',
             lambda m: self._get_tag("DATE", m.group(0)), text,
             flags=re.IGNORECASE)
         # English written dates: "4 February 2026", "March 1, 2025"
@@ -338,9 +447,38 @@ class RegexAnonymizer:
             if 8 <= len(re.sub(r'\D', '', m.group(0))) <= 15
             else m.group(0),
             text)
-        # ── Chemins UNC ──
+        # ── Références de contrat / commande / affaire ──
+        # Un numéro de contrat est structuré : le traiter en regex le rend
+        # déterministe au lieu de dépendre du LLM (qui les rate souvent).
+        # Deux formes couvertes :
+        #   "N°ABC-2024-0456", "no CMD-2026-0912"  (préfixe explicite)
+        #   "ABC-2024-0456"                         (3 groupes séparés par -)
+        # Volontairement strict pour ne pas attraper les références
+        # techniques : "S7-1500", "IEC 61850", "B2V" ne matchent pas.
+        # La valeur doit contenir un chiffre, sinon "N°" suivi d'un mot
+        # ordinaire suffirait : sans ce test, "notifie" était découpé en
+        # "no" + "tifie" et le mot disparaissait du texte.
+        def _ref(m: re.Match) -> str:
+            valeur = m.group(2)
+            if not any(c.isdigit() for c in valeur):
+                return m.group(0)
+            return m.group(1) + self._get_tag("REF", valeur)
+
         text = re.sub(
-            r'\\\\[a-zA-Z0-9\-_.]+(?:\\[a-zA-Z0-9\-_. ]+)+',
+            r'\b(N[°]\s*|n[°]\s*|No\.?\s+|n°\s*)([A-Za-z0-9][A-Za-z0-9\-/]{3,})',
+            _ref, text)
+        text = re.sub(
+            r'\b[A-Z]{2,5}-\d{4}-\d{3,6}\b',
+            lambda m: self._get_tag("REF", m.group(0)), text)
+        # ── Chemins UNC ──
+        # Les espaces ne sont acceptés que dans un segment intermédiaire
+        # ("\\SRV\Program Files\doc.txt") : autorisés dans le dernier
+        # segment, le pattern avalait le mot suivant dans la phrase
+        # ("\\SRV\Partage\Projets et ..." → le "et" disparaissait).
+        text = re.sub(
+            r'\\\\[a-zA-Z0-9\-_.]+'
+            r'(?:\\[a-zA-Z0-9\-_. ]*[a-zA-Z0-9\-_.])*'
+            r'\\[a-zA-Z0-9\-_.]+',
             lambda m: self._get_tag("CHEMIN", m.group(0)), text)
         # ── Chemins Linux /home ──
         text = re.sub(
@@ -433,13 +571,40 @@ Si le texte est déjà bien anonymisé, retourne-le TEL QUEL, caractère pour ca
 Retourne UNIQUEMENT le texte. Aucun commentaire."""
 
 
-def call_ollama_chat(text: str, system_prompt: str, model: str = "gpt-oss:20b",
+# Session réutilisée : garde la connexion HTTP ouverte entre les chunks
+# au lieu d'ouvrir un socket par appel.
+_SESSION = requests.Session() if HAS_REQUESTS else None
+
+# Estimation grossière chars → tokens (français + markdown).
+_CHARS_PER_TOKEN = 3.0
+
+
+def _size_context(system_prompt: str, text: str) -> tuple[int, int]:
+    """Dimensionne num_ctx / num_predict pour le chunk courant.
+
+    Un num_ctx fixe à 32768 force Ollama à allouer un cache KV de 32k
+    tokens par slot alors qu'un chunk de 4000 caractères en demande ~3k :
+    c'est de la VRAM gaspillée et du temps de chargement en plus.
+    La sortie fait au pire la taille de l'entrée (l'anonymisation raccourcit
+    le texte), d'où un num_predict calé sur l'entrée et non sur 8192.
+    """
+    in_tokens = int((len(system_prompt) + len(text)) / _CHARS_PER_TOKEN) + 64
+    num_predict = min(max(int(len(text) / _CHARS_PER_TOKEN * 1.4) + 256, 512),
+                      8192)
+    needed = in_tokens + num_predict
+    # Puissance de 2 immédiatement supérieure, bornée à [4096, 32768].
+    num_ctx = min(max(1 << max(needed - 1, 1).bit_length(), 4096), 32768)
+    return num_ctx, num_predict
+
+
+def call_ollama_chat(text: str, system_prompt: str, model: str = "mistral:latest",
                      base_url: str = "http://localhost:11434",
                      timeout: int = 300) -> tuple[str, bool]:
     if not HAS_REQUESTS:
         return text, False
+    num_ctx, num_predict = _size_context(system_prompt, text)
     try:
-        response = requests.post(
+        response = _SESSION.post(
             f"{base_url}/api/chat",
             json={
                 "model": model,
@@ -449,11 +614,13 @@ def call_ollama_chat(text: str, system_prompt: str, model: str = "gpt-oss:20b",
                      "content": f"Anonymise ce texte :\n\n{text}"}
                 ],
                 "stream": False,
+                # Garde le modèle chargé entre les chunks et entre les passes.
+                "keep_alive": "10m",
                 "options": {
                     "temperature": 0.05,
                     "top_p": 0.9,
-                    "num_predict": 8192,
-                    "num_ctx": 32768,
+                    "num_predict": num_predict,
+                    "num_ctx": num_ctx,
                 }
             },
             timeout=timeout
@@ -486,12 +653,22 @@ _R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 _A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 
-def _extract_docx_image_rels(doc) -> dict[str, tuple[bytes, str]]:
-    """Map relationship IDs to (image_bytes, extension) from a docx."""
+def _extract_docx_image_rels(part) -> dict[str, tuple[bytes, str]]:
+    """Map relationship IDs to (image_bytes, extension) for ONE docx part.
+
+    Chaque partie du docx (corps, en-tête, pied de page) a ses propres
+    relations, et un même identifiant (rId4) peut désigner deux images
+    différentes selon la partie. Il faut donc une table par partie, pas
+    une table globale.
+    """
     image_rels = {}
-    for rel_id, rel in doc.part.rels.items():
+    for rel_id, rel in part.rels.items():
         if "image" in rel.reltype:
-            blob = rel.target_part.blob
+            try:
+                blob = rel.target_part.blob
+            except Exception:
+                # Image liée (non embarquée) : pas de contenu disponible.
+                continue
             ct = rel.target_part.content_type or "image/png"
             ext = ct.split("/")[-1]
             if ext == "jpeg":
@@ -500,40 +677,80 @@ def _extract_docx_image_rels(doc) -> dict[str, tuple[bytes, str]]:
     return image_rels
 
 
+def _docx_para_text(para_element, image_rels, images: list) -> str:
+    """Texte d'un paragraphe, images remplacées par leur placeholder.
+
+    `images` est complété au fil du parcours : l'index d'une image dans
+    cette liste détermine son numéro de placeholder ET son nom de fichier
+    (IMAGE_N.ext), donc les deux restent alignés par construction.
+    """
+    morceaux: list[str] = []
+    for child in para_element:
+        if child.tag != f"{{{_W_NS}}}r":
+            continue
+        a_une_image = False
+        for blip in child.iter(f"{{{_A_NS}}}blip"):
+            embed = blip.get(f"{{{_R_NS}}}embed")
+            if embed and embed in image_rels:
+                images.append(image_rels[embed])
+                morceaux.append(f" [IMAGE_{len(images)}] ")
+                a_une_image = True
+        if not a_une_image:
+            for t_elem in child.iter(f"{{{_W_NS}}}t"):
+                if t_elem.text:
+                    morceaux.append(t_elem.text)
+    return "".join(morceaux)
+
+
+def _docx_walk(parent_element, image_rels, images: list) -> list[str]:
+    """Parcourt paragraphes ET tableaux dans l'ordre du document.
+
+    L'ancienne version listait `doc.paragraphs` puis `doc.tables`, ce qui
+    avait deux défauts : le contenu des tableaux se retrouvait rejeté à la
+    fin du document (contexte cassé pour le LLM), et les images contenues
+    dans les cellules n'étaient jamais extraites — un schéma ou une capture
+    d'écran dans un tableau passait donc sous le radar.
+    """
+    parts: list[str] = []
+    for child in parent_element:
+        if child.tag == f"{{{_W_NS}}}p":
+            parts.append(_docx_para_text(child, image_rels, images))
+        elif child.tag == f"{{{_W_NS}}}tbl":
+            for ligne in child.iterfind(f"{{{_W_NS}}}tr"):
+                cellules = []
+                for cellule in ligne.iterfind(f"{{{_W_NS}}}tc"):
+                    # Récursif : une cellule peut contenir des tableaux.
+                    contenu = _docx_walk(cellule, image_rels, images)
+                    cellules.append(" ".join(x for x in contenu if x.strip()))
+                parts.append(" | ".join(cellules))
+    return parts
+
+
 def _read_docx_with_images(data: bytes) -> tuple[str, list[tuple[bytes, str]]]:
     """Read docx → (text with [IMAGE_N] placeholders, [(bytes, ext), ...])."""
     doc = Document(io.BytesIO(data))
-    image_rels = _extract_docx_image_rels(doc)
     images: list[tuple[bytes, str]] = []
-    img_counter = 0
-    parts: list[str] = []
 
-    for para in doc.paragraphs:
-        para_parts: list[str] = []
-        for child in para._element:
-            tag = child.tag
-            # <w:r> — run element
-            if tag == f"{{{_W_NS}}}r":
-                has_image = False
-                for blip in child.iter(f"{{{_A_NS}}}blip"):
-                    embed = blip.get(f"{{{_R_NS}}}embed")
-                    if embed and embed in image_rels:
-                        img_counter += 1
-                        images.append(image_rels[embed])
-                        para_parts.append(f" [IMAGE_{img_counter}] ")
-                        has_image = True
-                if not has_image:
-                    for t_elem in child.iter(f"{{{_W_NS}}}t"):
-                        if t_elem.text:
-                            para_parts.append(t_elem.text)
-        parts.append("".join(para_parts))
+    # En-têtes et pieds de page : c'est là que se trouvent les logos, qui
+    # identifient le client aussi sûrement qu'un nom. On les extrait pour
+    # qu'ils soient soumis à relecture comme les autres. Chaque zone a ses
+    # propres relations d'images.
+    entetes: list[str] = []
+    vues: set[int] = set()
+    for section in doc.sections:
+        for zone in (section.header, section.footer):
+            if zone is None or id(zone.part) in vues:
+                continue
+            vues.add(id(zone.part))
+            rels_zone = _extract_docx_image_rels(zone.part)
+            for para in zone.paragraphs:
+                texte = _docx_para_text(para._element, rels_zone, images)
+                if texte.strip():
+                    entetes.append(texte)
 
-    # Tables
-    for table in doc.tables:
-        for row in table.rows:
-            for cell in row.cells:
-                parts.append(cell.text)
-
+    image_rels = _extract_docx_image_rels(doc.part)
+    corps = _docx_walk(doc.element.body, image_rels, images)
+    parts = entetes + corps
     return "\n".join(parts), images
 
 
@@ -580,12 +797,10 @@ def read_file(filepath: Path) -> str:
             print("❌ pip install python-docx", file=sys.stderr)
             sys.exit(1)
         doc = Document(str(filepath))
-        parts = [p.text for p in doc.paragraphs]
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    parts.append(cell.text)
-        return "\n".join(parts)
+        # Même parcours ordonné que la lecture avec images : une table de
+        # relations vide fait qu'aucun placeholder n'est émis, tout en
+        # gardant les tableaux à leur place dans le document.
+        return "\n".join(_docx_walk(doc.element.body, {}, []))
     elif suffix == ".pdf":
         if not HAS_PDF:
             print("❌ pip install pymupdf", file=sys.stderr)
@@ -634,12 +849,8 @@ def read_file_bytes(data: bytes, filename: str) -> str:
         if not HAS_DOCX:
             raise ImportError("python-docx requis : pip install python-docx")
         doc = Document(io.BytesIO(data))
-        parts = [p.text for p in doc.paragraphs]
-        for table in doc.tables:
-            for row in table.rows:
-                for cell in row.cells:
-                    parts.append(cell.text)
-        return "\n".join(parts)
+        # Idem : parcours ordonné, sans placeholders d'images.
+        return "\n".join(_docx_walk(doc.element.body, {}, []))
     elif suffix == ".pdf":
         if not HAS_PDF:
             raise ImportError("pymupdf requis : pip install pymupdf")
@@ -730,6 +941,32 @@ def split_into_chunks(text: str, max_chars: int = 4000) -> list[str]:
 # VÉRIFICATION POST-ANONYMISATION
 # =============================================================================
 
+# Catégories de tags que le pipeline est censé produire. Un petit modèle
+# invente parfois ses propres catégories (ex. [MARQUE_TECHNIQUE_1] pour
+# "Siemens"), ce qui signifie qu'il anonymise des termes techniques que la
+# liste d'exclusion du prompt protège — et détruit l'intérêt du document.
+TAGS_AUTORISES = {
+    "IP", "EMAIL", "TEL", "DATE", "SERVEUR", "CHEMIN", "SECRET", "IMAGE",
+    "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "LIEU", "REF",
+}
+
+
+def check_tag_vocabulary(text: str, extra: set[str] | None = None) -> list[str]:
+    """Repère les catégories de tags hors vocabulaire attendu."""
+    autorisees = TAGS_AUTORISES | (extra or set())
+    trouvees = set(re.findall(r'\[([A-Z][A-Z_]*)_\d+\]', text))
+    inventees = sorted(trouvees - autorisees)
+    if not inventees:
+        return []
+    return [(
+        "Catégories de tags inventées par le LLM : "
+        + ", ".join(f"[{c}_N]" for c in inventees)
+        + ". Le modèle a probablement anonymisé des termes techniques "
+        "(marques, protocoles, logiciels) qui devaient rester en clair. "
+        "Relisez le document : son contenu technique peut être appauvri."
+    )]
+
+
 def post_check(text: str) -> list[str]:
     warnings = []
     ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', text)
@@ -773,7 +1010,7 @@ def count_llm_tags(text: str) -> dict[str, int]:
 
 def check_ollama(
     base_url: str = "http://localhost:11434",
-    model: str = "gpt-oss:20b",
+    model: str = "mistral:latest",
 ) -> tuple[bool, str, list[str]]:
     if not HAS_REQUESTS:
         return False, "Module 'requests' non installé", []
@@ -797,20 +1034,35 @@ def check_ollama(
 
 def _run_llm_pass(chunks, system_prompt, pass_name, log, model, ollama_url,
                   timeout, cancel_flag, on_progress,
-                  done_chunks_ref, total_chunks):
-    """Execute one LLM pass on a list of chunks. Returns result list."""
+                  done_chunks_ref, total_chunks, parallel: int = 1):
+    """Execute one LLM pass on a list of chunks. Returns result list.
+
+    Les chunks sont indépendants (chacun est un appel /api/chat isolé), donc
+    `parallel` > 1 les envoie de front. Si Ollama ne sert qu'un slot
+    (OLLAMA_NUM_PARALLEL=1) les requêtes sont simplement mises en file :
+    aucun risque, juste aucun gain.
+    """
     log.stats["llm_passes"] += 1
-    result_chunks = []
-    for i, chunk in enumerate(chunks, 1):
+    n = len(chunks)
+    results: list[str] = list(chunks)
+    lock = threading.Lock()
+
+    def process(item) -> None:
+        i, chunk = item
         if cancel_flag and cancel_flag.is_set():
-            log.log("STOP", "Annulé par l'utilisateur.")
-            log.stats["annule"] = True
-            result_chunks.append(chunk)
-            continue
-        progress = 0.2 + (done_chunks_ref[0] / total_chunks) * 0.65
+            with lock:
+                already = log.stats["annule"]
+                log.stats["annule"] = True
+            if not already:
+                log.log("STOP", "Annulé par l'utilisateur.")
+            results[i - 1] = chunk
+            return
+
+        with lock:
+            progress = 0.2 + (done_chunks_ref[0] / total_chunks) * 0.65
         log.log(
             "LLM",
-            f"  {pass_name} [{i}/{len(chunks)}] ({len(chunk)} chars)...",
+            f"  {pass_name} [{i}/{n}] ({len(chunk)} chars)...",
             progress=progress,
         )
         result, success = call_ollama_chat(
@@ -818,35 +1070,68 @@ def _run_llm_pass(chunks, system_prompt, pass_name, log, model, ollama_url,
             model=model, base_url=ollama_url, timeout=timeout,
         )
         if success:
-            if result.strip() == chunk.strip():
+            # Garde-fou d'intégrité : un petit modèle peut réécrire le
+            # contenu, le tronquer, ou recopier les exemples du prompt au
+            # lieu d'anonymiser. L'anonymisation ne fait que remplacer des
+            # entités par des tags plus courts : la longueur doit rester
+            # dans le même ordre de grandeur. Hors de cette plage, on
+            # préfère garder le texte d'origine (non anonymisé mais intact
+            # et signalé) plutôt qu'un document mutilé.
+            ratio = len(result.strip()) / max(len(chunk.strip()), 1)
+            if not 0.6 <= ratio <= 1.3:
                 log.log(
-                    "WARN",
-                    f"  {pass_name} [{i}/{len(chunks)}] "
-                    "LLM n'a fait aucun changement.",
+                    "ERROR",
+                    f"  {pass_name} [{i}/{n}] réponse REJETÉE "
+                    f"(taille {ratio:.0%} de l'entrée — le modèle a "
+                    "probablement réécrit ou tronqué le texte). "
+                    "Chunk d'origine conservé.",
                 )
-                log.stats["llm_no_change"] = (
-                    log.stats.get("llm_no_change", 0) + 1
-                )
+                log.bump("llm_rejets")
+                result = chunk
+            elif result.strip() == chunk.strip():
+                # Sur une passe de vérification, "aucun changement" est le
+                # résultat attendu quand rien n'a été oublié : ce n'est
+                # anormal que sur la passe d'anonymisation.
+                if "Passe 2" in pass_name:
+                    log.log(
+                        "WARN",
+                        f"  {pass_name} [{i}/{n}] "
+                        "LLM n'a fait aucun changement.",
+                    )
+                    log.bump("llm_no_change")
+                else:
+                    log.log(
+                        "OK",
+                        f"  {pass_name} [{i}/{n}] aucun oubli détecté.",
+                    )
             else:
-                log.log(
-                    "OK", f"  {pass_name} [{i}/{len(chunks)}] traité."
-                )
+                log.log("OK", f"  {pass_name} [{i}/{n}] traité.")
         else:
             log.log(
                 "ERROR" if "Passe 2" in pass_name else "WARN",
-                f"  {pass_name} [{i}/{len(chunks)}] erreur — texte conservé.",
+                f"  {pass_name} [{i}/{n}] erreur — texte conservé.",
             )
-            log.stats["llm_erreurs"] += 1
-        result_chunks.append(result)
-        log.stats["llm_chunks_traites"] += 1
-        done_chunks_ref[0] += 1
-        progress = 0.2 + (done_chunks_ref[0] / total_chunks) * 0.65
+            log.bump("llm_erreurs")
+        results[i - 1] = result
+        log.bump("llm_chunks_traites")
+        with lock:
+            done_chunks_ref[0] += 1
+            done = done_chunks_ref[0]
         if on_progress:
             on_progress(
-                f"{pass_name} — chunk {i}/{len(chunks)} — {log.elapsed()}",
-                progress,
+                f"{pass_name} — chunk {i}/{n} — {log.elapsed()}",
+                0.2 + (done / total_chunks) * 0.65,
             )
-    return result_chunks
+
+    items = list(enumerate(chunks, 1))
+    workers = max(1, min(parallel, n))
+    if workers == 1:
+        for item in items:
+            process(item)
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            list(pool.map(process, items))
+    return results
 
 
 def run_pipeline(
@@ -854,9 +1139,9 @@ def run_pipeline(
     filename: str = "document",
     custom_words: dict[str, str] | None = None,
     use_llm: bool = True,
-    model: str = "gpt-oss:20b",
+    model: str = "mistral:latest",
     ollama_url: str = "http://localhost:11434",
-    chunk_size: int = 4000,
+    chunk_size: int = 1500,
     passes: int = 2,
     timeout: int = 300,
     on_progress: Callable[[str, float], None] | None = None,
@@ -864,12 +1149,14 @@ def run_pipeline(
     images_count: int = 0,
     images_folder: str = "",
     deep_analysis: bool = False,
+    parallel: int = 3,
+    verbose: bool = True,
 ) -> dict:
     """
     Execute the full anonymization pipeline.
     Returns {text, mapping, report, warnings, stats}.
     """
-    log = Logger(on_progress=on_progress)
+    log = Logger(on_progress=on_progress, verbose=verbose)
     log.stats["fichier_source"] = filename
     log.stats["taille_originale"] = len(text)
     log.stats["images_trouvees"] = images_count
@@ -898,9 +1185,10 @@ def run_pipeline(
 
     # ── Passe 1 : Regex ──────────────────────────────────────
     log.log("REGEX", "Passe 1 : Anonymisation regex...", progress=0.1)
+    tags_avant_regex = len(regex_anon.mapping)
     text = regex_anon.anonymize(text)
     log.stats["regex_remplacements"] = (
-        len(regex_anon.mapping) - (len(custom_words) if custom_words else 0)
+        len(regex_anon.mapping) - tags_avant_regex
     )
     log.log(
         "REGEX", f"{log.stats['regex_remplacements']} patterns regex remplacés."
@@ -908,7 +1196,13 @@ def run_pipeline(
 
     # ── Passes LLM ───────────────────────────────────────────
     llm_entity_map = {}
-    cancelled = cancel_flag and cancel_flag.is_set()
+    cancelled = bool(cancel_flag and cancel_flag.is_set())
+    if cancelled:
+        # Annulation avant même le démarrage du LLM : sans ce marquage, le
+        # document sortait anonymisé par la regex seule mais présenté comme
+        # complet, aucun avertissement ne signalant qu'il est partiel.
+        log.stats["annule"] = True
+        log.log("STOP", "Annulé avant la passe LLM.")
 
     if use_llm and not cancelled:
         log.log(
@@ -939,6 +1233,7 @@ def run_pipeline(
         result_chunks = _run_llm_pass(
             chunks, prompt_p2, "Passe 2", log, model, ollama_url,
             timeout, cancel_flag, on_progress, done_ref, total_chunks,
+            parallel=parallel,
         )
         text = "\n\n".join(result_chunks)
 
@@ -948,7 +1243,7 @@ def run_pipeline(
             result_chunks2 = _run_llm_pass(
                 chunks2, prompt_p3, "Passe 3 vérif", log, model,
                 ollama_url, timeout, cancel_flag, on_progress,
-                done_ref, total_chunks,
+                done_ref, total_chunks, parallel=parallel,
             )
             text = "\n\n".join(result_chunks2)
 
@@ -958,7 +1253,7 @@ def run_pipeline(
             result_chunks3 = _run_llm_pass(
                 chunks3, prompt_p3, "Passe 4 strict", log, model,
                 ollama_url, timeout, cancel_flag, on_progress,
-                done_ref, total_chunks,
+                done_ref, total_chunks, parallel=parallel,
             )
             text = "\n\n".join(result_chunks3)
 
@@ -969,6 +1264,44 @@ def run_pipeline(
     # ── Vérification finale ──────────────────────────────────
     log.log("VERIF", "Vérification post-anonymisation...", progress=0.9)
     warnings = post_check(text)
+    # Les catégories du dictionnaire utilisateur sont légitimes.
+    warnings += check_tag_vocabulary(
+        text,
+        extra={c.upper() for c in (custom_words or {}).values()},
+    )
+
+    # Un chunk dont l'appel LLM a échoué (timeout, Ollama surchargé) est
+    # conservé TEL QUEL : le document de sortie contient alors encore les
+    # noms, sociétés et lieux de cette portion. C'était jusqu'ici une simple
+    # métrique dans le rapport — pour un outil d'anonymisation, ça doit être
+    # un avertissement en évidence.
+    if log.stats["llm_erreurs"] > 0:
+        warnings.insert(0, (
+            f"⚠️ {log.stats['llm_erreurs']} chunk(s) NON traité(s) par le LLM "
+            "(timeout ou Ollama indisponible) : ces portions sont restées "
+            "en clair et peuvent encore contenir des noms, sociétés ou lieux. "
+            "NE PAS partager ce document sans relecture — augmentez --timeout "
+            "ou utilisez un modèle plus léger."
+        ))
+    if log.stats.get("llm_rejets", 0) > 0:
+        warnings.insert(0, (
+            f"⚠️ {log.stats['llm_rejets']} réponse(s) LLM REJETÉE(S) : le "
+            "modèle a réécrit ou tronqué le texte au lieu de l'anonymiser. "
+            "Ces portions ont été conservées TELLES QUELLES (donc non "
+            "anonymisées) pour ne pas mutiler le document. Le modèle choisi "
+            "est probablement trop petit pour cette tâche."
+        ))
+    if log.stats.get("llm_no_change", 0) > 0:
+        warnings.insert(0, (
+            f"⚠️ {log.stats['llm_no_change']} chunk(s) renvoyé(s) à "
+            "l'identique par le LLM : le modèle n'a probablement rien "
+            "anonymisé sur ces portions. Vérifiez le modèle choisi."
+        ))
+    if log.stats["annule"]:
+        warnings.insert(0, (
+            "⚠️ Traitement ANNULÉ : le document est partiellement anonymisé."
+        ))
+
     log.stats["verif_warnings"] = warnings
     if warnings:
         for w in warnings:
@@ -982,8 +1315,8 @@ def run_pipeline(
     # ── Mapping ──────────────────────────────────────────────
     mapping_export = {}
     for key, tag in regex_anon.mapping.items():
-        _, original = key.split("::", 1)
-        mapping_export[tag] = original
+        _, normalise = key.split("::", 1)
+        mapping_export[tag] = regex_anon.originals.get(tag, normalise)
     for tag in llm_entity_map:
         if tag not in mapping_export:
             mapping_export[tag] = "⟨détecté par LLM⟩"
@@ -1019,18 +1352,23 @@ Exemples :
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("fichier", help="Fichier à anonymiser")
-    parser.add_argument("--model", default="gpt-oss:20b", help="Modèle Ollama")
+    parser.add_argument("--model", default="mistral:latest", help="Modèle Ollama")
     parser.add_argument("--output", "-o", help="Fichier de sortie")
     parser.add_argument("--ollama-url", default="http://localhost:11434")
     parser.add_argument("--no-llm", action="store_true",
                         help="Regex uniquement")
-    parser.add_argument("--chunk-size", type=int, default=4000)
+    parser.add_argument("--chunk-size", type=int, default=1500)
     parser.add_argument("--passes", type=int, default=2, choices=[1, 2, 3])
     parser.add_argument("--timeout", type=int, default=300)
     parser.add_argument(
         "--dict", metavar="FILE",
         help="Dictionnaire de mots sensibles (JSON). "
              "Défaut : sensitive-words.json à côté du script",
+    )
+    parser.add_argument(
+        "--parallel", type=int, default=3, metavar="N",
+        help="Chunks envoyes en parallele a Ollama (defaut 3). "
+             "Mettre 1 pour serialiser.",
     )
     parser.add_argument(
         "--deep", action="store_true",
@@ -1074,6 +1412,7 @@ Exemples :
         images_count=len(images),
         images_folder=images_folder_name,
         deep_analysis=args.deep,
+        parallel=args.parallel,
     )
 
     output_path = (
@@ -1107,7 +1446,15 @@ Exemples :
         print(f"  🖼️  Images       : {len(images)} → {images_folder_name}/")
     print(f"  ⏱️  Durée        : {s['duree_totale']}s")
     print(f"  ✅ Sortie       : {output_path}")
-    print(f"{'='*60}\n")
+    print(f"{'='*60}")
+    # Le fichier est toujours écrit : si des portions n'ont pas été
+    # anonymisées, il faut que ça saute aux yeux en fin de run.
+    if result["warnings"]:
+        print()
+        for w in result["warnings"]:
+            print(f"  ⚠️  {w}")
+        print(f"{'='*60}")
+    print()
 
 
 if __name__ == "__main__":

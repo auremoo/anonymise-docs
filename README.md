@@ -49,6 +49,23 @@ You want to use Claude, ChatGPT, or any cloud AI to analyze your documents — b
 | `<name>_rapport.md` | Detailed anonymization report with stats | Optional — useful for audit |
 | `<name>_images/` | Extracted images (IMAGE_1.png, IMAGE_2.jpg...) | **Review first** — check for sensitive content |
 
+### Image extraction
+
+The `[IMAGE_N]` placeholder left in the text and the `IMAGE_N.ext` file on
+disk always carry the same number, so you can match each placeholder to the
+exact file it replaced.
+
+| Image location | .docx | .pdf |
+|---|---|---|
+| Paragraph | yes | yes (per page) |
+| Table cell | yes | — |
+| Header / footer (logos) | yes | — |
+| Nested table | yes (recursive) | — |
+
+Images are never anonymized — they are only extracted so you can review
+them yourself. A screenshot, a logo or a signature identifies a client as
+surely as a name does.
+
 ## Installation
 
 ### Prerequisites
@@ -79,13 +96,23 @@ ollama --version
 ### 2. Pull the LLM model
 
 ```bash
-ollama pull gpt-oss:20b
+ollama pull mistral
 ```
 
-> This is a ~12 GB download. For faster but less accurate results, you can use a smaller model:
-> ```bash
-> ollama pull gpt-oss:8b
-> ```
+> **The model must fit in your GPU's VRAM, not your system RAM.** Whatever
+> does not fit runs on the CPU, 10 to 50 times slower. Check with
+> `curl localhost:11434/api/ps` that `size_vram` is close to `size`.
+>
+> Measured on a 4 GB GPU (RTX 500 Ada), one LLM pass over a 3.8 KB document:
+>
+> | Model | On GPU | Duration | Outcome |
+> |---|---|---|---|
+> | `qwen2.5:3b` | 100 % | 29 s | Unusable — rewrites the document, copies the prompt's own examples |
+> | `mistral` (7B) | 32 % | 170 s | Workable — text preserved, misses some entities |
+> | `gpt-oss:20b` | 23 % | 1934 s | Best quality where it completes, but 2 of 4 chunks hit the timeout and were left in clear |
+>
+> With 8 GB of VRAM or more, `gpt-oss:20b` becomes the better choice: its
+> tagging is more accurate and it does not invent tag categories.
 
 Start Ollama (if not already running):
 ```bash
@@ -139,14 +166,16 @@ python anonymize.py big_file.docx --chunk-size 2000
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--model` | `gpt-oss:20b` | Ollama model to use |
+| `--model` | `mistral:latest` | Ollama model to use |
 | `--output`, `-o` | `<name>_anonymise.md` | Output file path |
 | `--ollama-url` | `http://localhost:11434` | Ollama API URL |
 | `--no-llm` | `false` | Regex-only mode (no LLM) |
-| `--chunk-size` | `4000` | Max characters per LLM chunk |
+| `--chunk-size` | `1500` | Max characters per LLM chunk. Smaller = fewer missed entities at the end of a chunk, and faster (attention cost is quadratic) |
 | `--passes` | `2` | LLM passes: 1, 2, or 3 |
 | `--timeout` | `300` | Timeout per Ollama request (seconds) |
-| `--dict` | `sensitive-words.json` | Persistent dictionary of sensitive words (JSON) |
+| `--dict` | `sensitive-words.json` | Persistent dictionary of sensitive words (JSON). Case-insensitive |
+| | | Supports `*` as a wildcard: `QU-OPE*` covers `QU-OPE-1234`, `QU-OPE-5678`... |
+| `--parallel` | `3` | Chunks sent to Ollama concurrently. Only helps if `OLLAMA_NUM_PARALLEL` > 1 server-side |
 
 ### Supported file formats
 
@@ -179,21 +208,38 @@ python anonymize.py big_file.docx --chunk-size 2000
 | `[SERVEUR_n]` | FQDN / server names | Regex |
 | `[CHEMIN_n]` | File paths (UNC, Linux) | Regex |
 | `[SECRET_n]` | Credentials, connection strings, API keys | Regex |
+| `[REF_n]` | Contract / order numbers (`N°ABC-2024-0456`) | Regex |
 | `[PERSONNE_n]` | Person names | LLM |
 | `[ENTREPRISE_n]` | Company / organization names | LLM |
 | `[SITE_n]` | Site / building names | LLM |
 | `[PROJET_n]` | Internal project names | LLM |
 | `[LIEU_n]` | Physical addresses / cities | LLM |
-| `[REF_n]` | Contract numbers, client refs | LLM |
+| `[REF_n]` | Other client references | LLM |
 | `[IMAGE_n]` | Image placeholders (docx/pdf) | Extraction |
 
 ## Web interface (Streamlit)
 
-A graphical interface is available for drag & drop usage:
+A graphical interface is available for drag & drop usage.
+
+**Easiest way** — starts Ollama if it is not already running, then opens
+the interface:
+
+```bash
+python lancer.py
+```
+
+On Windows you can simply double-click `lancer.bat`.
+
+Or start the interface alone (Ollama must already be running):
 
 ```bash
 python -m streamlit run app.py
 ```
+
+The interface listens on `127.0.0.1` only: it is never reachable from the
+network. If Ollama is unreachable, or running with no model installed, the
+sidebar shows it in red and the Anonymize button is disabled until you
+either install a model or tick "Regex only".
 
 Features:
 - Bilingual interface (FR/EN toggle)
@@ -230,7 +276,8 @@ Vous voulez utiliser Claude, ChatGPT, ou tout autre IA cloud pour analyser vos d
 
 | Passe | Moteur | Ce qu'elle détecte |
 |-------|--------|-------------------|
-| 1 | **Regex** | IPv4/v6, FQDN (.local, .corp...), emails, téléphones, dates (FR/ISO), chemins UNC, chemins Linux, credentials/clés API |
+| 0 | **Dictionnaire** | Mots de `sensitive-words.json` — remplacement exact, insensible à la casse. **La seule passe fiable à 100 %** |
+| 1 | **Regex** | IPv4/v6, FQDN (.local, .corp...), emails, téléphones, dates (FR/ISO), chemins UNC, chemins Linux, credentials/clés API, références de contrat (`N°ABC-2024-0456`) |
 | 2 | **LLM local** | Noms de personnes, entreprises, sites/usines, projets internes, adresses physiques |
 | 3 | **LLM local** | Passe de vérification — attrape les oublis de la passe 2 |
 | 4 | **LLM local** (optionnel) | Re-vérification stricte (`--passes 3`) |
@@ -251,9 +298,25 @@ curl -fsSL https://ollama.com/install.sh | sh
 ### 2. Télécharger le modèle
 
 ```bash
-ollama pull gpt-oss:20b
-ollama serve  # si pas déjà lancé
+ollama pull mistral
 ```
+
+> **Le modèle doit tenir dans la VRAM du GPU, pas dans la RAM système.**
+> Ce qui n'y tient pas tourne sur le CPU, 10 à 50× plus lentement.
+> Vérifiez avec `curl localhost:11434/api/ps` que `size_vram` ≈ `size`.
+>
+> Mesuré sur un GPU 4 Go (RTX 500 Ada), une passe LLM sur 3,8 Ko :
+>
+> | Modèle | Sur GPU | Durée | Résultat |
+> |---|---|---|---|
+> | `qwen2.5:3b` | 100 % | 29 s | Inutilisable — réécrit le document, recopie les exemples du prompt |
+> | `mistral` (7B) | 32 % | 170 s | Exploitable — texte préservé, rate des entités |
+> | `gpt-oss:20b` | 23 % | 1934 s | Meilleure qualité là où il aboutit, mais 2 chunks sur 4 en timeout, laissés en clair |
+>
+> À partir de 8 Go de VRAM, `gpt-oss:20b` devient le meilleur choix :
+> tagging plus juste et pas de catégories inventées.
+
+Pas besoin de lancer `ollama serve` à la main : `lancer.py` le démarre.
 
 ### 3. Installer les dépendances Python
 
@@ -265,9 +328,26 @@ pip install -r requirements.txt
 
 ### Interface graphique (recommandé)
 
+**Le plus simple** — démarre Ollama s'il ne tourne pas, puis ouvre
+l'interface :
+
+```bash
+python lancer.py
+```
+
+Sous Windows, double-cliquez simplement sur `lancer.bat`.
+
+Ou l'interface seule (Ollama doit déjà tourner) :
+
 ```bash
 python -m streamlit run app.py
 ```
+
+L'interface n'écoute que sur `127.0.0.1` : elle n'est jamais joignable
+depuis le réseau. Si Ollama est absent, ou lancé sans aucun modèle
+installé, la barre latérale l'affiche en rouge et le bouton Anonymiser
+reste désactivé jusqu'à ce que vous installiez un modèle ou cochiez
+« Regex uniquement ».
 
 Ouvre une interface dans le navigateur avec :
 - Interface bilingue (FR/EN)
@@ -294,6 +374,40 @@ python anonymize.py notes.md --no-llm -o notes_clean.md
 python anonymize.py document.docx --dict mes_mots.json
 ```
 
+## Dictionnaire : joker `*`
+
+Un `*` dans un mot du dictionnaire couvre une série de références sans
+avoir à les lister :
+
+| Entrée | Attrape |
+|---|---|
+| `QU-OPE*` | `QU-OPE-1234`, `QU-OPE-5678`, `QU-OPE-1.2` |
+| `DV*` | `DV2601659`, `DV2601660` |
+
+Le joker ne franchit ni les espaces ni la ponctuation finale, et chaque
+référence reçoit son propre tag (`[REF_1]`, `[REF_2]`...) pour rester
+distinguable. Un motif trop large (`*`, `a*`) est ignoré.
+
+Le dictionnaire est **insensible à la casse** : `NEXANS`, `nexans` et
+`Nexans` donnent le même tag.
+
+## Extraction des images
+
+Le placeholder `[IMAGE_N]` laissé dans le texte et le fichier `IMAGE_N.ext`
+sur le disque portent toujours le même numéro : la correspondance est exacte,
+vous pouvez retrouver quel fichier remplace quel emplacement.
+
+| Emplacement de l'image | .docx | .pdf |
+|---|---|---|
+| Paragraphe | oui | oui (par page) |
+| Cellule de tableau | oui | — |
+| En-tête / pied de page (logos) | oui | — |
+| Tableau imbriqué | oui (récursif) | — |
+
+Les images ne sont **jamais** anonymisées : elles sont seulement extraites
+pour que vous les relisiez. Une capture d'écran, un logo ou une signature
+identifie un client aussi sûrement qu'un nom.
+
 ## Fichiers générés
 
 | Fichier | Contenu | Partageable ? |
@@ -311,6 +425,16 @@ python anonymize.py document.docx --dict mes_mots.json
 3. Envoyer le fichier anonymisé à Claude / ChatGPT
 4. Garder mon_cahier_des_charges_mapping.json en privé
 ```
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+72 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
+appels LLM sont simulés). Les documents docx/pdf de test sont générés à
+l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 
 ## Auteur & licence / Author & License
 

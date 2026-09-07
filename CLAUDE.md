@@ -41,11 +41,13 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | Classe/Fonction | Rôle |
 |----------------|------|
 | `run_pipeline()` | Pipeline principal — appelable depuis CLI ou UI, retourne dict. Accepte `cancel_flag` (threading.Event) et `on_progress` callback |
-| `_run_llm_pass()` | Helper DRY pour exécuter une passe LLM sur tous les chunks |
-| `apply_custom_words()` | Passe 0 — remplacement exact de mots saisis par l'utilisateur |
+| `_run_llm_pass()` | Helper DRY pour exécuter une passe LLM sur tous les chunks — parallélise les chunks via `parallel` (défaut 3), résultats réordonnés |
+| `apply_custom_words()` | Passe 0 — remplacement de mots saisis par l'utilisateur, en un seul parcours (regex en alternance). Un `*` agit comme joker |
+| `_motif_mot()` | Traduit un mot du dictionnaire en regex : tout est échappé sauf `*` |
 | `load_sensitive_words()` / `save_sensitive_words()` | Chargement/sauvegarde du dictionnaire persistant `sensitive-words.json` |
 | `RegexAnonymizer` | Passe 1 — patterns structurés (IP, email, dates, FQDN, chemins, téléphones, credentials) |
-| `call_ollama_chat()` | Appel Ollama via `/api/chat` avec system prompt |
+| `call_ollama_chat()` | Appel Ollama via `/api/chat` avec system prompt — session HTTP réutilisée, `keep_alive: 10m` |
+| `_size_context()` | Calcule `num_ctx`/`num_predict` selon la taille du chunk (évite d'allouer 32k tokens de cache KV pour 4k caractères) |
 | `split_into_chunks()` | Découpage intelligent (paragraphes > lignes) |
 | `post_check()` | Vérification finale regex pour patterns résiduels |
 | `Logger` | Traçabilité complète + callback UI + génération du rapport + timer (`elapsed()`) |
@@ -82,7 +84,126 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 
 - **Python 3.10+**
 - **Ollama** — runtime LLM local (`http://localhost:11434`)
-- **Modèle par défaut** : `gpt-oss:20b` (sélectionnable dans l'UI)
+- **Modèle par défaut** : `mistral:latest` (sélectionnable dans l'UI)
+- **Chunk par défaut** : 1500 caractères (voir mesures ci-dessous)
+
+### Contrainte matérielle — mesuré sur RTX 500 Ada (4 Go de VRAM)
+
+Le modèle doit **tenir dans la VRAM**, pas dans la RAM système. Ce qui
+n'y tient pas tourne sur CPU, 10 à 50× plus lentement. Vérifier avec
+`curl localhost:11434/api/ps` que `size_vram` ≈ `size`.
+
+| Modèle | VRAM / total | 1 passe sur 3,8 Ko | Résultat |
+|---|---|---|---|
+| `qwen2.5:3b` | 2,4 / 2,4 Go (100 %) | 29 s | **Inutilisable** — réécrit le document, recopie les exemples du prompt, 6 entités en clair |
+| `mistral:latest` | 3,0 / 9,3 Go (32 %) | 170 s (chunk 1500) | **Le moins mauvais** — texte préservé, 3 entités en clair, sur-anonymise des termes techniques |
+| `gpt-oss:20b` | 3,4 / 15 Go (23 %) | 1934 s | Inexploitable — 2 chunks sur 4 en timeout, laissés en clair |
+
+Mesures à n=1 : le LLM n'est pas déterministe (`temperature: 0.05` ≠ 0),
+les entités détectées varient d'un run à l'autre.
+
+**Conséquence pratique :** aucun modèle local testé sur cette machine
+n'anonymise de façon fiable. La partie déterministe (regex + dictionnaire
+`sensitive-words.json`) est la seule à garantir un résultat. Mettre les
+entités qui comptent dans le dictionnaire ; traiter la passe LLM comme un
+filet d'appoint, jamais comme une garantie.
+
+### Mesure : dictionnaire + mistral sur le même document
+
+| Catégorie | Résultat |
+|---|---|
+| 11 entités présentes dans `sensitive-words.json` | **11/11 remplacées** (passe 0, déterministe, insensible à la casse) |
+| Références de contrat `N°ABC-2024-0456` | **taguées** (passe 1, regex `REF`) |
+| Villes/lieux absents du dictionnaire | **en clair** — mistral n'en a rattrapé qu'1 sur 6 |
+| 8 termes techniques (Siemens, Profinet, WinCC…) | **8/8 préservés** |
+
+Le dictionnaire est le mécanisme fiable. Tout ce qui n'y est pas doit être
+considéré comme susceptible de fuiter, quelle que soit la passe LLM.
+
+### Débit mesuré et extrapolation
+
+| Moteur | Débit (1 passe) |
+|---|---|
+| `gpt-oss:20b` | **2,3 car./s** (optimiste : calculé sur les 2 chunks qui ont abouti) |
+| `mistral` | **25,3 car./s** |
+| Regex + dictionnaire (`--no-llm`) | **2 400 000 car./s** |
+
+Extrapolation pour un PDF de 197 pages (~2500 car./page, 2 passes) :
+
+| Moteur | Durée |
+|---|---|
+| `gpt-oss:20b` | ~5 jours — et avec le timeout par défaut la majorité des chunks échouerait, sortant **en clair** |
+| `mistral` | ~11 h |
+| `--no-llm` + dictionnaire | **< 1 s** |
+
+**Sur un document volumineux, la passe LLM n'est pas une option praticable
+sur ce matériel.** Le mode `--no-llm` avec un dictionnaire bien garni
+traite 197 pages instantanément et de façon déterministe.
+
+### Taux de réussite mesuré (document de test, 14 entités)
+
+| | À périmètre strictement égal | Résultat réel sur le document |
+|---|---|---|
+| `gpt-oss:20b` | 4/4 | **29 %** (2 chunks sur 4 en timeout) |
+| `mistral` | 4/4 | **86 %** |
+
+À périmètre égal les deux sont à égalité, mais sur **4 entités seulement** :
+l'échantillon ne permet pas de les départager sur le rappel. La différence
+de 29 % contre 86 % vient entièrement des chunks non traités, pas de la
+qualité du modèle. Là où le 20b est réellement supérieur : il n'invente
+pas de catégories de tags, contrairement à mistral (`[MARQUE_TECHNIQUE_1]`,
+`[PRESTATION_1]`).
+
+### Effet de la taille de chunk (mistral, même document)
+
+| chunk_size | Durée | Entités en clair |
+|---|---|---|
+| 4000 | 250 s | 5 |
+| 1500 | 170 s | 3 |
+
+Chunks plus petits = plus rapide (coût quadratique de l'attention) et
+moins d'oublis en fin de chunk. Contrepartie : la numérotation des tags
+LLM n'est pas cohérente entre chunks (chaque chunk repart de son propre
+comptage), donc deux sociétés différentes peuvent devenir `[ENTREPRISE_1]`
+dans deux chunks distincts.
+
+### Extraction d'images — correspondance vérifiée
+
+Le numéro du placeholder `[IMAGE_N]` et le nom de fichier `IMAGE_N.ext`
+sont alignés par construction : l'index dans la liste `images` sert aux
+deux. Vérifié par test sur des images de couleurs distinctes.
+
+| Emplacement de l'image | docx | pdf |
+|---|---|---|
+| Paragraphe | oui | oui (par page) |
+| **Cellule de tableau** | oui | — |
+| En-tête / pied de page (logos) | oui | — |
+| Tableau imbriqué | oui (récursif) | — |
+
+`_docx_walk()` parcourt le corps dans **l'ordre du document** (paragraphes
+et tableaux entrelacés). L'ancienne version listait `doc.paragraphs` puis
+`doc.tables`, ce qui rejetait tout le contenu des tableaux en fin de
+document et ne voyait aucune image de cellule. Les en-têtes ont leurs
+propres relations d'images : une table de relations **par partie** du
+docx est nécessaire, un même `rId` pouvant désigner deux images
+différentes selon la partie.
+
+Le mode sans extraction d'images utilise le même parcours ordonné avec
+une table de relations vide (aucun placeholder émis).
+
+### Garde-fous du pipeline
+
+| Contrôle | Déclenchement |
+|---|---|
+| Rejet d'intégrité | Réponse LLM hors de 60–130 % de la taille d'entrée → chunk d'origine conservé et signalé (attrape la réécriture/troncature) |
+| Vocabulaire de tags | `check_tag_vocabulary()` — catégorie inventée (`[MARQUE_TECHNIQUE_1]`…) = sur-anonymisation de termes techniques |
+| Chunks non traités | Timeout ou Ollama absent → portion restée en clair, avertissement en tête des warnings |
+
+Ces trois cas remontent dans `result["warnings"]`, donc dans le rapport,
+dans l'UI Streamlit et en fin de run CLI. **Un document peut être produit
+en n'étant que partiellement anonymisé — c'est le mode d'échec principal
+de l'outil et il doit rester visible.**
+
 - **Streamlit** — interface web locale bilingue FR/EN
 - **Dépendances** : `requests`, `python-docx`, `pymupdf`, `streamlit`, `pandas`
 
@@ -92,7 +213,7 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 
 Format : `[CATEGORIE_N]` avec numérotation séquentielle par catégorie.
 
-**Tags Regex** : `IP`, `EMAIL`, `TEL`, `DATE`, `SERVEUR`, `CHEMIN`, `SECRET`
+**Tags Regex** : `IP`, `EMAIL`, `TEL`, `DATE`, `SERVEUR`, `CHEMIN`, `SECRET`, `REF`
 **Tags LLM** : `PERSONNE`, `ENTREPRISE`, `SITE`, `PROJET`, `LIEU`, `REF`
 **Tags Extraction** : `IMAGE` (placeholders pour images extraites de docx/pdf)
 
@@ -121,10 +242,53 @@ Les prompts système sont dans les constantes `SYSTEM_PROMPT_PASS2` et `SYSTEM_P
 - Le rapport doit toujours être généré, même en cas d'erreurs LLM
 - L'annulation via `cancel_flag` doit retourner un résultat partiel cohérent
 
+## Dictionnaire : joker `*`
+
+Un `*` dans un mot du dictionnaire couvre une série de références sans
+les lister une par une :
+
+| Entrée | Attrape | Ne franchit pas |
+|---|---|---|
+| `QU-OPE*` | `QU-OPE-1234`, `QU-OPE-5678`, `QU-OPE-1.2` | les espaces, la ponctuation finale |
+| `DV*` | `DV2601659`, `DV2601660` | idem |
+
+Chaque occurrence distincte reçoit **son propre tag** (`[REF_1]`,
+`[REF_2]`...), donc les références restent distinguables dans le document
+anonymisé. Un motif dont la partie littérale fait moins de 2 caractères
+(`*`, `a*`) est **ignoré** : il anonymiserait le document entier.
+
+## Tests
+
+```bash
+python -m unittest discover -s tests -t .
+```
+
+72 tests, sans dépendance externe et sans Ollama (les appels LLM sont
+simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
+le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
+document sensible par accident.
+
+| Fichier | Couvre |
+|---|---|
+| `test_regex.py` | Passe 1 — chaque test correspond à un bug rencontré, y compris les cas qui ne doivent **pas** matcher (termes techniques, mots avalés) |
+| `test_dictionnaire.py` | Passe 0 — casse, joker `*`, tags fantômes, fichier de dictionnaire |
+| `test_extraction.py` | docx/pdf — correspondance placeholder ↔ fichier vérifiée **par la couleur des pixels** (un simple comptage ne détecte pas un décalage de numérotation) |
+| `test_garde_fous.py` | Rejet d'intégrité, catégories inventées, chunks non traités, annulation, ordre des chunks en parallèle |
+
+`run_pipeline(..., verbose=False)` coupe l'affichage console tout en
+gardant le journal complet dans le rapport.
+
 ## Commandes fréquentes
 
 ```bash
-# Interface web
+# Lanceur tout-en-un (demarre Ollama si besoin + interface web)
+python lancer.py
+# ou double-clic sur lancer.bat
+
+# Lanceur sans interface (demarre seulement Ollama)
+python lancer.py --no-web
+
+# Interface web seule
 python -m streamlit run app.py
 
 # CLI — usage standard (avec extraction d'images)
@@ -138,6 +302,9 @@ python anonymize.py document.docx --dict mes_mots.json
 
 # CLI — 3 passes LLM (max qualité)
 python anonymize.py document.docx --passes 3
+
+# CLI — nombre de chunks envoyés en parallèle à Ollama (défaut 3)
+python anonymize.py document.docx --parallel 1
 
 # Vérifier qu'Ollama tourne
 curl http://localhost:11434/api/tags

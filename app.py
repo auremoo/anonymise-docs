@@ -66,15 +66,25 @@ TEXTS = {
     },
     "custom_words_caption": {
         "FR": "Ajoutez des mots/noms spécifiques à remplacer en priorité "
-              "(avant regex et LLM).",
+              "(avant regex et LLM). Insensible à la casse. `*` = joker "
+              "(`QU-OPE*` couvre toute la série). **C'est la seule passe "
+              "fiable à 100 %** : mettez-y vos clients, sites et collègues "
+              "récurrents.",
         "EN": "Add specific words/names to replace first "
-              "(before regex and LLM).",
+              "(before regex and LLM). Case-insensitive. `*` = wildcard "
+              "(`QU-OPE*` covers the whole series). **This is the only "
+              "100 % reliable pass** — put your recurring clients, sites "
+              "and colleagues here.",
     },
     "col_word": {"FR": "Mot / Nom", "EN": "Word / Name"},
     "col_category": {"FR": "Catégorie", "EN": "Category"},
     "col_word_help": {
-        "FR": "Le mot ou nom à anonymiser (ex: Jean Dupont, Acme Corp)",
-        "EN": "The word or name to anonymize (e.g. John Doe, Acme Corp)",
+        "FR": "Le mot ou nom à anonymiser (ex: Jean Dupont, Acme Corp). "
+              "Insensible à la casse. Le caractère * sert de joker : "
+              "QU-OPE* couvre QU-OPE-1234, QU-OPE-5678...",
+        "EN": "The word or name to anonymize (e.g. John Doe, Acme Corp). "
+              "Case-insensitive. Use * as a wildcard: QU-OPE* covers "
+              "QU-OPE-1234, QU-OPE-5678...",
     },
     "col_category_help": {
         "FR": "Type d'entité",
@@ -112,6 +122,18 @@ TEXTS = {
               "lancez `ollama serve`.",
         "EN": "Ollama is not connected. Enable 'Regex only' or "
               "run `ollama serve`.",
+    },
+    "no_model_warning": {
+        "FR": "Ollama est lancé mais **aucun modèle n'est installé**. "
+              "Installez-en un avec `ollama pull mistral`, ou cochez "
+              "« Regex uniquement » pour continuer sans LLM.",
+        "EN": "Ollama is running but **no model is installed**. "
+              "Install one with `ollama pull mistral`, or check "
+              "\"Regex only\" to continue without an LLM.",
+    },
+    "no_model_status": {
+        "FR": "Aucun modèle installé",
+        "EN": "No model installed",
     },
     "btn_anonymize": {"FR": "Anonymiser", "EN": "Anonymize"},
     "btn_stop": {"FR": "Arrêter", "EN": "Stop"},
@@ -182,6 +204,17 @@ TEXTS = {
 }
 
 
+@st.cache_data(ttl=15, show_spinner=False)
+def cached_check_ollama(url: str, model: str):
+    """check_ollama() mis en cache 15 s.
+
+    La sidebar est re-rendue a chaque interaction et a chaque tick de la
+    boucle de progression : sans cache, chaque rerun declenche un appel
+    HTTP a Ollama.
+    """
+    return check_ollama(url, model)
+
+
 def t(key: str) -> str:
     """Get translated string for current language."""
     lang = st.session_state.get("lang", "FR")
@@ -194,7 +227,7 @@ def t(key: str) -> str:
 # =============================================================================
 
 OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "gpt-oss:20b"
+DEFAULT_MODEL = "mistral:latest"
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 CATEGORIES = [
@@ -264,9 +297,14 @@ with st.sidebar:
     st.header(t("status"))
 
     # Check Ollama + get available models
-    connected, msg, available_models = check_ollama(OLLAMA_URL, DEFAULT_MODEL)
+    connected, msg, available_models = cached_check_ollama(
+        OLLAMA_URL, DEFAULT_MODEL
+    )
 
-    if connected and DEFAULT_MODEL in " ".join(available_models):
+    if connected and not available_models:
+        # Ollama répond mais n'a aucun modèle : inutilisable pour le LLM.
+        st.error(f"\U0001f534 {t('no_model_status')}")
+    elif connected and DEFAULT_MODEL in " ".join(available_models):
         st.success(f"\U0001f7e2 {msg}")
     elif connected:
         st.warning(f"\U0001f7e1 {msg}")
@@ -419,9 +457,16 @@ with col4:
 st.divider()
 
 can_run = uploaded_file is not None and not pipe["running"]
-if not connected and not no_llm:
-    st.warning(t("ollama_warning"))
-    can_run = False
+# Le LLM est demandé : il faut Ollama joignable ET au moins un modèle
+# installé. Sans ce second test, un Ollama vide laissait lancer un run
+# qui échouait sur tous les chunks.
+if not no_llm:
+    if not connected:
+        st.warning(t("ollama_warning"))
+        can_run = False
+    elif not available_models:
+        st.warning(t("no_model_warning"))
+        can_run = False
 
 btn_col1, btn_col2 = st.columns([3, 1])
 
@@ -691,17 +736,21 @@ if pipe["result"] is not None:
         )
 
     if images:
-        # Create a zip of all images for download
-        zip_buffer = io.BytesIO()
-        with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-            for i, (img_data, ext) in enumerate(images, 1):
-                zf.writestr(f"IMAGE_{i}.{ext}", img_data)
-        zip_buffer.seek(0)
+        # Zip construit une seule fois par document : le bloc r\u00e9sultats est
+        # re-rendu \u00e0 chaque rerun (changement de langue, clic sur un onglet)
+        # et recompresser toutes les images \u00e0 chaque fois ne sert \u00e0 rien.
+        zip_key = f"_images_zip_{filename_stem}"
+        if zip_key not in st.session_state:
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
+                for i, (img_data, ext) in enumerate(images, 1):
+                    zf.writestr(f"IMAGE_{i}.{ext}", img_data)
+            st.session_state[zip_key] = zip_buffer.getvalue()
 
         with dl_cols[3]:
             st.download_button(
                 f"\u2b07\ufe0f {t('dl_images')}",
-                data=zip_buffer.getvalue(),
+                data=st.session_state[zip_key],
                 file_name=f"{filename_stem}_images.zip",
                 mime="application/zip",
                 width="stretch",

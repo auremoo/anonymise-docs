@@ -2,4 +2,9 @@
 gatherUsageStats = false
 
 [server]
+# Ecoute uniquement en local : le principe du projet est qu'aucune
+# donnee ne quitte la machine. Sans cette ligne, Streamlit ecoute sur
+# toutes les interfaces et l'interface (donc les documents charges)
+# est joignable depuis le reseau.
+address = "127.0.0.1"
 headless = true
