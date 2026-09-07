@@ -967,6 +967,38 @@ def check_tag_vocabulary(text: str, extra: set[str] | None = None) -> list[str]:
     )]
 
 
+def check_tags_colles(text: str) -> list[str]:
+    """Repère les tags collés à un fragment de mot resté en clair.
+
+    Un tag légitime remplace une entité entière, donc il est bordé par un
+    espace ou de la ponctuation. Quand le LLM ne tague qu'une PARTIE d'une
+    référence technique, il reste un morceau collé au tag :
+
+        "automates S7-1500"  ->  "automates [ENTREPRISE_1]-1500"
+
+    C'est une mutilation silencieuse : la catégorie est légitime, donc
+    `check_tag_vocabulary()` ne voit rien. Le `/` est exclu car un chemin
+    tronqué ("[CHEMIN_1]/scripts") est un cas normal de la passe regex.
+    """
+    suspects = set()
+    # Tag suivi d'un fragment : [X_1]-1500, [X_1]abc
+    suspects.update(re.findall(
+        r'(\[[A-Z][A-Z_]*_\d+\][-_]?[A-Za-z0-9]+)', text))
+    # Tag précédé d'un fragment : abc[X_1]
+    suspects.update(re.findall(
+        r'([A-Za-z0-9]+[-_]?\[[A-Z][A-Z_]*_\d+\])', text))
+    if not suspects:
+        return []
+    apercu = ", ".join(f"« {s} »" for s in sorted(suspects)[:5])
+    return [(
+        f"{len(suspects)} tag(s) collé(s) à du texte resté en clair : "
+        f"{apercu}. Le LLM n'a tagué qu'une partie d'une référence "
+        "technique (ex. « S7-1500 » → « [ENTREPRISE_1]-1500 »), ce qui "
+        "mutile le contenu et laisse un fragment lisible. Vérifiez ces "
+        "passages."
+    )]
+
+
 def post_check(text: str) -> list[str]:
     warnings = []
     ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', text)
@@ -1269,6 +1301,7 @@ def run_pipeline(
         text,
         extra={c.upper() for c in (custom_words or {}).values()},
     )
+    warnings += check_tags_colles(text)
 
     # Un chunk dont l'appel LLM a échoué (timeout, Ollama surchargé) est
     # conservé TEL QUEL : le document de sortie contient alors encore les

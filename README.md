@@ -451,7 +451,7 @@ identifie un client aussi sûrement qu'un nom.
 python -m unittest discover -s tests -t .
 ```
 
-79 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
+82 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 

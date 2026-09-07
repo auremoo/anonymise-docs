@@ -17,6 +17,7 @@ import anonymize
 from anonymize import (
     run_pipeline, check_tag_vocabulary, post_check, split_into_chunks,
     _size_context, _run_llm_pass, Logger, SYSTEM_PROMPT_PASS2,
+    check_tags_colles,
 )
 
 TEXTE = "La societe Nexans et Jean Dupont a Lyon travaillent ensemble.\n" * 4
@@ -113,6 +114,36 @@ class TestVocabulaireDeTags(unittest.TestCase):
         self.assertEqual(len(avert), 1)
         self.assertIn("LOGICIEL", avert[0])
         self.assertIn("MARQUE", avert[0])
+
+
+class TestTagsColles(unittest.TestCase):
+    """Observé avec mistral : "automates S7-1500" devenait
+    "[ENTREPRISE_1]-1500". La catégorie est légitime, donc le contrôle de
+    vocabulaire ne voit rien — seule l'adjacence trahit la mutilation."""
+
+    def test_reference_technique_mutilee_detectee(self):
+        for texte in ("Les automates [ENTREPRISE_1]-1500 en Profinet",
+                      "carte [ENTREPRISE_2]343-1 installee",
+                      "site de [LIEU_1]-sur-Mer",
+                      "prefixe[PERSONNE_1] colle"):
+            self.assertTrue(check_tags_colles(texte), texte)
+
+    def test_pas_de_faux_positif(self):
+        """Un chemin tronqué par la passe regex ("[CHEMIN_1]/scripts") est
+        normal, la ponctuation aussi."""
+        for texte in ("script dans [CHEMIN_1]/scripts",
+                      "Password=[SECRET_1];Uid=[SECRET_2];",
+                      "contrat N°[REF_1] notifie",
+                      "[PERSONNE_1] chez [ENTREPRISE_1] a [LIEU_1].",
+                      "voir [IMAGE_1] puis [IMAGE_2]",
+                      "([REF_1]) et [REF_2],"):
+            self.assertEqual(check_tags_colles(texte), [], texte)
+
+    def test_remonte_dans_les_avertissements(self):
+        r = _pipeline(lambda t: (t.replace("Nexans", "[ENTREPRISE_9]-1500"),
+                                 True))
+        self.assertTrue(any("collé" in w for w in r["warnings"]),
+                        r["warnings"])
 
 
 class TestPasseDeVerification(unittest.TestCase):

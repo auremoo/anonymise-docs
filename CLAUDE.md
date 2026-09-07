@@ -155,6 +155,25 @@ qualité du modèle. Là où le 20b est réellement supérieur : il n'invente
 pas de catégories de tags, contrairement à mistral (`[MARQUE_TECHNIQUE_1]`,
 `[PRESTATION_1]`).
 
+### Ce que le LLM sait distinguer (mesuré, mistral)
+
+Document mélangeant références internes et acronymes techniques, **sans
+dictionnaire ni aide de la regex** (Regex : 0) :
+
+| Catégorie | Résultat |
+|---|---|
+| Références commerciales (`QU-WIN-123`, `DV2601659`, `24-0871`) | **4/4 taguées** — la regex n'en attrapait aucune |
+| Termes techniques (SCADA, WinCC, OPC UA, Profinet, IEC 61850, B2V, PLC, IHM, VLAN 42, CP343-1) | **11/13 préservés** |
+| Références de procédure (`PR-QSE-07`, `REF-INT-2024-88`) | **laissées en clair** |
+| `S7-1500` | → `[ENTREPRISE_1]-1500` : « S7 » tagué comme société, référence mutilée |
+| `TGBT` | → `[ENTREPRISE_2]` : un tableau général basse tension devient une société |
+
+Le LLM apporte donc une vraie valeur sur les références que la regex ne
+peut pas décrire, mais il se trompe dans les deux sens. `TGBT` remplacé
+en entier n'est **détectable par aucun contrôle** — seule la relecture
+l'attrape. Conclusion inchangée : les familles de références connues
+vont dans le dictionnaire avec un joker (`QU-*`, `DV*`, `PR-*`).
+
 ### Effet de la taille de chunk (mistral, même document)
 
 | chunk_size | Durée | Entités en clair |
@@ -198,6 +217,7 @@ une table de relations vide (aucun placeholder émis).
 |---|---|
 | Rejet d'intégrité | Réponse LLM hors de 60–130 % de la taille d'entrée → chunk d'origine conservé et signalé (attrape la réécriture/troncature) |
 | Vocabulaire de tags | `check_tag_vocabulary()` — catégorie inventée (`[MARQUE_TECHNIQUE_1]`…) = sur-anonymisation de termes techniques |
+| Tags collés | `check_tags_colles()` — un tag suivi d'un fragment (`[ENTREPRISE_1]-1500`) révèle que le LLM n'a tagué qu'une partie d'une référence technique. La catégorie étant légitime, c'est le seul signal disponible |
 | Chunks non traités | Timeout ou Ollama absent → portion restée en clair, avertissement en tête des warnings |
 
 Ces trois cas remontent dans `result["warnings"]`, donc dans le rapport,
@@ -264,7 +284,7 @@ anonymisé. Un motif dont la partie littérale fait moins de 2 caractères
 python -m unittest discover -s tests -t .
 ```
 
-79 tests, sans dépendance externe et sans Ollama (les appels LLM sont
+82 tests, sans dépendance externe et sans Ollama (les appels LLM sont
 simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.
