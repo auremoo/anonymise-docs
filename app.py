@@ -181,6 +181,28 @@ TEXTS = {
     "dl_mapping": {"FR": "Mapping (.json)", "EN": "Mapping (.json)"},
     "dl_report": {"FR": "Rapport (.md)", "EN": "Report (.md)"},
     "dl_images": {"FR": "Images (.zip)", "EN": "Images (.zip)"},
+    "files_written_to": {
+        "FR": "Le traitement continue même si vous fermez cette page. "
+              "Les fichiers sont écrits dans",
+        "EN": "Processing continues even if you close this page. "
+              "Files are written to",
+    },
+    "previous_files_title": {
+        "FR": "Fichiers déjà produits (dossier output/)",
+        "EN": "Files already produced (output/ folder)",
+    },
+    "previous_files_caption": {
+        "FR": "Tout traitement terminé écrit ses fichiers ici, même si "
+              "l'interface a perdu la session entre-temps. Inutile de "
+              "passer par l'explorateur de fichiers.",
+        "EN": "Every finished run writes its files here, even if the "
+              "interface lost the session in the meantime. No need to "
+              "dig through the file explorer.",
+    },
+    "no_previous_files": {
+        "FR": "Aucun fichier produit pour l'instant.",
+        "EN": "No files produced yet.",
+    },
     "output_saved": {
         "FR": "Fichiers sauvegardés dans",
         "EN": "Files saved to",
@@ -247,6 +269,16 @@ TEXTS = {
     "deep_analysis": {
         "FR": "Analyse approfondie",
         "EN": "Deep analysis",
+    },
+    "deep_analysis_na": {
+        "FR": "Sans effet sur ce modèle : l'option repose sur "
+              "l'instruction « Reasoning: low », propre à la famille "
+              "gpt-oss. Elle est grisée pour ne pas laisser croire à un "
+              "réglage de qualité.",
+        "EN": "No effect on this model: the option relies on the "
+              "\"Reasoning: low\" instruction, specific to the gpt-oss "
+              "family. Greyed out so it does not look like a quality "
+              "setting.",
     },
     "deep_analysis_help": {
         "FR": "Le LLM réfléchit plus — plus précis pour les noms/prénoms "
@@ -635,11 +667,17 @@ with col2:
         disabled=pipe["running"],
     )
 with col3:
+    # L'option n'agit qu'en injectant « Reasoning: low » dans le prompt,
+    # une instruction propre à la famille gpt-oss. Sur mistral ou tout
+    # autre modèle, elle ne change rien : autant la griser plutôt que de
+    # laisser croire à un réglage de qualité.
+    modele_raisonneur = "gpt-oss" in (selected_model or "").lower()
     deep_analysis = st.checkbox(
         t("deep_analysis"),
         value=False,
-        help=t("deep_analysis_help"),
-        disabled=pipe["running"] or no_llm,
+        help=t("deep_analysis_help") if modele_raisonneur
+        else t("deep_analysis_na"),
+        disabled=pipe["running"] or no_llm or not modele_raisonneur,
     )
 with col4:
     extract_imgs = st.checkbox(
@@ -807,23 +845,71 @@ if run_clicked:
 
 # ── Polling while pipeline runs ──────────────────────────────
 
-if pipe["running"]:
-    progress_container = st.empty()
-    avertissement_arret = st.empty()
+@st.fragment(run_every=1.0)
+def afficher_progression():
+    """Affiche l'avancement sans bloquer le script.
+
+    L'ancienne version bouclait avec `time.sleep()` jusqu'à la fin du
+    pipeline. Sur un traitement de plusieurs heures, ce run de script
+    interminable finissait par perdre la liaison avec le navigateur :
+    l'interface restait figée sur son dernier rendu (boutons désactivés,
+    aucune progression) alors que le thread continuait en arrière-plan,
+    et les résultats ne s'affichaient jamais.
+
+    Un fragment se re-exécute tout seul chaque seconde, donc le script
+    principal se termine immédiatement et la session reste saine, quelle
+    que soit la durée du traitement.
+    """
+    if not pipe["running"]:
+        # Le pipeline vient de finir : on relance le script complet pour
+        # afficher les résultats et réactiver les boutons.
+        st.rerun(scope="app")
+        return
+
+    st.progress(
+        min(max(pipe["pct"], 0.0), 1.0),
+        text=pipe["msg"] or t("starting"),
+    )
     if pipe.get("cancelling"):
-        avertissement_arret.warning(t("cancelling"))
-    while pipe["running"]:
-        msg = pipe["msg"] or t("starting")
-        pct = pipe["pct"]
-        progress_container.progress(min(max(pct, 0.0), 1.0), text=msg)
-        time.sleep(0.3)
-    # Pipeline finished — brief display of final state
-    if st.session_state.cancel_flag.is_set():
-        progress_container.progress(1.0, text=t("cancelled"))
-    else:
-        progress_container.progress(1.0, text=t("done"))
-    time.sleep(1)
-    st.rerun()  # One final rerun to show results with enabled controls
+        st.warning(t("cancelling"))
+    # Rappel permanent : même si la page est fermée ou rechargée, le
+    # traitement continue et les fichiers sont écrits sur le disque.
+    st.caption(f"{t('files_written_to')} `output/`")
+
+
+if pipe["running"]:
+    afficher_progression()
+
+# ── Fichiers déjà produits ───────────────────────────────────
+# Filet de sécurité : un traitement long peut se terminer alors que la
+# session de l'interface a été perdue. Les fichiers sont alors sur le
+# disque mais invisibles ici. Ce panneau les retrouve, pour ne pas avoir
+# à fouiller l'explorateur.
+
+if not pipe["running"] and OUTPUT_DIR.exists():
+    produits = sorted(
+        (f for f in OUTPUT_DIR.iterdir() if f.is_file()),
+        key=lambda f: f.stat().st_mtime, reverse=True,
+    )
+    if produits:
+        with st.expander(f"\U0001f4c1 {t('previous_files_title')}"):
+            st.caption(t("previous_files_caption"))
+            for fichier in produits[:12]:
+                col_nom, col_dl = st.columns([4, 1])
+                taille = fichier.stat().st_size
+                unite = f"{taille / 1024:.0f} Ko" if taille < 1_048_576 \
+                    else f"{taille / 1_048_576:.1f} Mo"
+                horodatage = time.strftime(
+                    "%d/%m %H:%M", time.localtime(fichier.stat().st_mtime))
+                col_nom.write(f"`{fichier.name}` — {unite} — {horodatage}")
+                with col_dl:
+                    st.download_button(
+                        "⬇️",
+                        data=fichier.read_bytes(),
+                        file_name=fichier.name,
+                        key=f"dl_prev_{fichier.name}",
+                        width="stretch",
+                    )
 
 # ── Pipeline error ───────────────────────────────────────────
 

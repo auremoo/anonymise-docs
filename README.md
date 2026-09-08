@@ -172,9 +172,9 @@ python anonymize.py big_file.docx --chunk-size 2000
 | `--no-llm` | `false` | Regex-only mode (no LLM) |
 | `--chunk-size` | `1500` | Max characters per LLM chunk. Smaller = fewer missed entities at the end of a chunk, and faster (attention cost is quadratic) |
 | `--passes` | `2` | LLM passes: 1, 2, or 3 |
-| `--timeout` | `300` | Timeout per Ollama request (seconds) |
+| `--timeout` | `900` | Timeout per Ollama request (seconds). At 300 s, 7 chunks out of 254 expired on a real document and came out in clear |
 | `--dict` | `sensitive-words.json` | Persistent dictionary of sensitive words (JSON). Case-insensitive; `*` acts as a wildcard (`DOC-A*` covers `DOC-A-1234`, `DOC-A-5678`...) |
-| `--parallel` | `3` | Chunks sent to Ollama concurrently. Only helps if `OLLAMA_NUM_PARALLEL` > 1 server-side |
+| `--parallel` | `1` | Chunks sent to Ollama concurrently. Measured on 254 real chunks: 3 slots gave **no speedup** (the GPU was already saturated) but tripled each chunk's duration and caused 7 timeouts |
 
 In the web interface, the dictionary can also be edited as raw JSON
 (faster than the row-by-row table for bulk entry). Invalid JSON is
@@ -473,7 +473,7 @@ identifie un client aussi sûrement qu'un nom.
 python -m unittest discover -s tests -t .
 ```
 
-98 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
+104 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 

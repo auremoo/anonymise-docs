@@ -265,3 +265,65 @@ class TestVerificationFinale(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAnalyseApprofondie(unittest.TestCase):
+    """L'option n'agit qu'en injectant « Reasoning: low » dans le prompt,
+    une instruction propre à la famille gpt-oss. Sur mistral elle ne
+    changeait rien, mais l'interface laissait croire à un réglage de
+    qualité — et l'utilisateur attribuait la lenteur à cette case."""
+
+    def _prompts_vus(self, modele, deep):
+        vus = []
+
+        def capture(texte, prompt, **kw):
+            vus.append(prompt)
+            return texte, True
+
+        with mock.patch.object(anonymize, "check_ollama",
+                               return_value=(True, "ok", [modele])), \
+             mock.patch.object(anonymize, "call_ollama_chat",
+                               side_effect=capture):
+            r = run_pipeline(text=TEXTE, filename="t", use_llm=True,
+                             passes=1, model=modele, deep_analysis=deep,
+                             verbose=False)
+        return vus, r
+
+    def test_prefixe_applique_sur_gpt_oss(self):
+        vus, _ = self._prompts_vus("gpt-oss:20b", deep=False)
+        self.assertTrue(vus[0].startswith("Reasoning: low"))
+
+    def test_prefixe_absent_en_mode_approfondi(self):
+        vus, _ = self._prompts_vus("gpt-oss:20b", deep=True)
+        self.assertFalse(vus[0].startswith("Reasoning: low"))
+
+    def test_aucun_prefixe_sur_les_autres_modeles(self):
+        """Ni en mode rapide ni en mode approfondi : le prompt est le
+        même, donc l'option est bien sans effet."""
+        rapide, _ = self._prompts_vus("mistral:latest", deep=False)
+        profond, _ = self._prompts_vus("mistral:latest", deep=True)
+        self.assertFalse(rapide[0].startswith("Reasoning: low"))
+        self.assertEqual(rapide[0], profond[0])
+
+    def test_option_ignoree_est_journalisee(self):
+        _, r = self._prompts_vus("mistral:latest", deep=True)
+        self.assertIn("gpt-oss", r["report"])
+
+
+class TestValeursParDefaut(unittest.TestCase):
+    """Défauts corrigés après un run réel de 254 chunks : 3 slots Ollama
+    triplaient la durée de chaque chunk (206 s au lieu de 69 s de temps
+    GPU utile) et 7 chunks expiraient au timeout de 300 s, sortant en
+    clair."""
+
+    def test_un_seul_chunk_a_la_fois(self):
+        import inspect
+        params = inspect.signature(run_pipeline).parameters
+        self.assertEqual(params["parallel"].default, 1)
+
+    def test_timeout_superieur_a_la_duree_moyenne_mesuree(self):
+        import inspect
+        params = inspect.signature(run_pipeline).parameters
+        # La moyenne mesurée est de 206 s par chunk : 300 s était trop
+        # juste, le défaut doit laisser une marge nette.
+        self.assertGreaterEqual(params["timeout"].default, 600)

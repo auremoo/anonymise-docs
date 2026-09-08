@@ -41,7 +41,7 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | Classe/Fonction | Rôle |
 |----------------|------|
 | `run_pipeline()` | Pipeline principal — appelable depuis CLI ou UI, retourne dict. Accepte `cancel_flag` (threading.Event) et `on_progress` callback |
-| `_run_llm_pass()` | Helper DRY pour exécuter une passe LLM sur tous les chunks — parallélise les chunks via `parallel` (défaut 3), résultats réordonnés |
+| `_run_llm_pass()` | Helper DRY pour exécuter une passe LLM sur tous les chunks — parallélise les chunks via `parallel` (défaut 1 — mesuré sans gain, voir plus bas), résultats réordonnés |
 | `apply_custom_words()` | Passe 0 — remplacement de mots saisis par l'utilisateur, en un seul parcours (regex en alternance). Un `*` agit comme joker |
 | `_motif_mot()` | Traduit un mot du dictionnaire en regex : tout est échappé sauf `*` |
 | `normaliser_texte()` | Ramène la typographie docx/pdf à l'ASCII avant toute recherche (tirets unicode, espaces insécables, coupures de ligne) |
@@ -70,8 +70,9 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | Save dictionary | Bouton pour sauvegarder les mots custom dans `sensitive-words.json` |
 | Éditeur JSON | Expander pour éditer/coller le dictionnaire en bloc — bien plus rapide que la saisie ligne par ligne. Validation stricte : un JSON mal formé est refusé sans écraser le fichier existant |
 | Image extraction | Checkbox pour activer l'extraction d'images docx/pdf |
-| Progress bar | Callback `on_progress` depuis `run_pipeline()` avec timer |
-| Stop button | Met `cancel_flag.set()`, pipeline s'arrête entre les chunks |
+| Progress bar | Fragment `afficher_progression()` avec `run_every=1s`. **Ne jamais revenir à une boucle bloquante** : un run de script de plusieurs heures perd la liaison navigateur, l'interface se figeait sur son dernier rendu et les résultats ne s'affichaient jamais |
+| Fichiers déjà produits | Expander listant `output/` avec boutons de téléchargement — filet si la session est perdue pendant un traitement long |
+| Stop button | Met `cancel_flag.set()`, pipeline s'arrête **entre** les chunks : le bloc déjà parti chez Ollama doit revenir. Le bouton se désactive au clic et un message explique l'attente |
 | Tabs avant/après | Prévisualisation du résultat + rapport |
 | Download buttons | Fichier anonymisé, mapping, rapport, images (zip) |
 
@@ -175,6 +176,46 @@ en entier n'est **détectable par aucun contrôle** — seule la relecture
 l'attrape. Conclusion inchangée : les familles de références connues
 vont dans le dictionnaire avec un joker (`DOC-*`, `PR-*`, `CAPA-*`).
 
+### Run réel de 197 pages — où part le temps
+
+304 672 caractères, 254 chunks, `mistral`, 1 passe. Durée : **17 483 s
+(4 h 51)**, conforme à l'extrapolation.
+
+| Mesure | Valeur |
+|---|---|
+| Somme des durées de chunk | 52 304 s (14,5 h) |
+| Durée réelle | 17 483 s |
+| Rapport | **3,0** — trois chunks tournaient en parallèle |
+| Durée moyenne par chunk | 206 s (pour 1181 car.) |
+| Temps GPU utile par chunk | ~69 s |
+| Chunks expirés au timeout de 300 s | **7** — sortis en clair |
+
+**`--parallel 3` n'apportait aucun gain** : le GPU était déjà saturé, la
+concurrence ne faisait que tripler la durée de chaque chunk — et
+provoquait les 7 timeouts. Défaut ramené à **1**, timeout à **900 s**.
+
+### Y a-t-il encore de l'optimisation possible ? (mesuré, non)
+
+Recherche de travail redondant sur ce document réel :
+
+| Piste | Résultat |
+|---|---|
+| Chunks en doublon (cache possible) | **0 %** — aucun |
+| Chunks sans aucun candidat d'entité | 6,2 % seulement |
+| Parallélisme | déjà saturé, aucun gain |
+
+Il n'y a **pas de gain logiciel à récupérer** : le travail est
+irréductible et le GPU est le goulot. Les seuls vrais leviers :
+
+1. **`--no-llm` + dictionnaire garni** — instantané, déterministe. On
+   perd la détection des noms *inconnus*, pas celle des entités connues.
+2. **Plus de VRAM.** `mistral` ne tient qu'à 32 % sur ce GPU, les 68 %
+   restants tournent sur CPU — c'est là qu'est le facteur. À titre
+   indicatif : `qwen2.5:3b`, entièrement en VRAM, atteignait 133 car./s
+   contre 25 car./s pour `mistral` à 32 %.
+3. **Cibler** : passer au LLM les seules pages qui comptent, le reste en
+   regex.
+
 ### Effet de la taille de chunk (mistral, même document)
 
 | chunk_size | Durée | Entités en clair |
@@ -239,6 +280,8 @@ Format : `[CATEGORIE_N]` avec numérotation séquentielle par catégorie.
 
 **Tags Regex** : `IP`, `EMAIL`, `TEL`, `DATE`, `SERVEUR`, `CHEMIN`, `SECRET`, `REF`
 **Tags LLM** : `PERSONNE`, `ENTREPRISE`, `SITE`, `PROJET`, `LIEU`, `REF`
+**Analyse approfondie** : l'option n'injecte que « Reasoning: low », instruction propre à `gpt-oss`. Elle est **sans effet sur tout autre modèle** — grisée dans l'UI et journalisée si demandée, pour ne pas laisser croire à un réglage de qualité.
+
 **Tags dictionnaire** : les précédents plus `PROCESS` (procédés, recettes, gammes de fabrication) — proposé dans l'UI et accepté par `check_tag_vocabulary()`, mais **non demandé au LLM** : lui faire taguer des procédés reviendrait à supprimer le contexte technique du document.
 **Tags Extraction** : `IMAGE` (placeholders pour images extraites de docx/pdf)
 
@@ -347,7 +390,7 @@ n'anonymisait rien du tout.
 python -m unittest discover -s tests -t .
 ```
 
-98 tests, sans dépendance externe et sans Ollama (les appels LLM sont
+104 tests, sans dépendance externe et sans Ollama (les appels LLM sont
 simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.

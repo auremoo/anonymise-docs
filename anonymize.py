@@ -634,7 +634,7 @@ def _size_context(system_prompt: str, text: str) -> tuple[int, int]:
 
 def call_ollama_chat(text: str, system_prompt: str, model: str = "mistral:latest",
                      base_url: str = "http://localhost:11434",
-                     timeout: int = 300) -> tuple[str, bool]:
+                     timeout: int = 900) -> tuple[str, bool]:
     if not HAS_REQUESTS:
         return text, False
     num_ctx, num_predict = _size_context(system_prompt, text)
@@ -1272,13 +1272,13 @@ def run_pipeline(
     ollama_url: str = "http://localhost:11434",
     chunk_size: int = 1500,
     passes: int = 2,
-    timeout: int = 300,
+    timeout: int = 900,
     on_progress: Callable[[str, float], None] | None = None,
     cancel_flag: threading.Event | None = None,
     images_count: int = 0,
     images_folder: str = "",
     deep_analysis: bool = False,
-    parallel: int = 3,
+    parallel: int = 1,
     verbose: bool = True,
 ) -> dict:
     """
@@ -1352,12 +1352,26 @@ def run_pipeline(
             use_llm = False
 
     if use_llm and not cancelled:
-        # Préfixe Reasoning: low pour le mode rapide (par défaut)
-        reasoning_prefix = "" if deep_analysis else "Reasoning: low\n\n"
+        # « Reasoning: low » est une instruction propre à la famille
+        # gpt-oss. Sur tout autre modèle, c'est du texte inerte ajouté au
+        # prompt : l'option n'a alors aucun effet, autant le dire plutôt
+        # que de laisser croire à un réglage de qualité.
+        modele_raisonneur = "gpt-oss" in model.lower()
+        if modele_raisonneur:
+            reasoning_prefix = "" if deep_analysis else "Reasoning: low\n\n"
+            mode_label = "approfondie" if deep_analysis else "rapide"
+        else:
+            reasoning_prefix = ""
+            mode_label = "option sans effet sur ce modèle"
+            if deep_analysis:
+                log.log(
+                    "WARN",
+                    "L'analyse approfondie ne s'applique qu'aux modèles "
+                    f"gpt-oss ; elle est ignorée pour {model}.",
+                )
         prompt_p2 = reasoning_prefix + SYSTEM_PROMPT_PASS2
         prompt_p3 = reasoning_prefix + SYSTEM_PROMPT_PASS3
 
-        mode_label = "approfondie" if deep_analysis else "rapide"
         log.log("OK", f"Ollama OK — {model} (analyse {mode_label}).",
                 progress=0.18)
         chunks = split_into_chunks(text, chunk_size)
@@ -1506,16 +1520,24 @@ Exemples :
                         help="Regex uniquement")
     parser.add_argument("--chunk-size", type=int, default=1500)
     parser.add_argument("--passes", type=int, default=2, choices=[1, 2, 3])
-    parser.add_argument("--timeout", type=int, default=300)
+    parser.add_argument(
+        "--timeout", type=int, default=900,
+        help="Delai max par requete Ollama (defaut 900 s). A 300 s, "
+             "7 chunks sur 254 ont expire sur un document reel et sont "
+             "sortis EN CLAIR.",
+    )
     parser.add_argument(
         "--dict", metavar="FILE",
         help="Dictionnaire de mots sensibles (JSON). "
              "Défaut : sensitive-words.json à côté du script",
     )
     parser.add_argument(
-        "--parallel", type=int, default=3, metavar="N",
-        help="Chunks envoyes en parallele a Ollama (defaut 3). "
-             "Mettre 1 pour serialiser.",
+        "--parallel", type=int, default=1, metavar="N",
+        help="Chunks envoyes en parallele a Ollama (defaut 1). "
+             "Au-dela de 1, chaque slot Ollama reclame son propre cache "
+             "KV : sur un GPU a faible VRAM cela chasse le modele vers le "
+             "CPU et ralentit chaque chunk. Mesure sur 254 chunks reels : "
+             "3 slots = 206 s par chunk contre 69 s de temps GPU utile.",
     )
     parser.add_argument(
         "--deep", action="store_true",
