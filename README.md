@@ -71,9 +71,32 @@ surely as a name does.
 ### Prerequisites
 
 - **Python 3.10+**
-- **Ollama** — local LLM runtime
+- **Ollama** (Windows/Linux) or **LM Studio** (macOS) — local LLM runtime
 
-### 1. Install Ollama
+### macOS: LM Studio
+
+1. Install LM Studio from https://lmstudio.ai/download and open it once
+   (this installs the `lms` command in `~/.lmstudio/bin`).
+2. Download a model: `lms get qwen/qwen3.5-9b` (or from the app).
+3. Double-click `lancer.command`. The first run creates a `.venv` and
+   installs the Python dependencies; then it starts the LM Studio server
+   (`lms server start`) and opens the interface.
+
+The CLI uses LM Studio by default on macOS (`--backend ollama` to switch):
+```bash
+.venv/bin/python anonymize.py document.docx
+```
+
+> Apple Silicon shares memory between CPU and GPU: the VRAM limit measured
+> on the Windows machine below does not apply. Measured on an Apple M5
+> (16 GB) with `qwen/qwen3.5-9b`, 1.9 KB document, 2 passes: **54 s,
+> ~70 chars/s per pass** (mistral on the 4 GB GPU: 25 chars/s).
+>
+> The model's *thinking* mode is switched off by the tool: left on,
+> qwen3.5 spent 211 s reasoning on 150 characters and returned an empty
+> answer.
+
+### 1. Install Ollama (Windows/Linux)
 
 **Windows:**
 Download from https://ollama.com/download and run the installer.
@@ -166,9 +189,10 @@ python anonymize.py big_file.docx --chunk-size 2000
 
 | Option | Default | Description |
 |--------|---------|-------------|
-| `--model` | `mistral:latest` | Ollama model to use |
+| `--backend` | `lmstudio` on macOS, `ollama` elsewhere | Local LLM engine |
+| `--model` | `mistral:latest` (ollama), `qwen/qwen3.5-9b` (lmstudio) | Model to use |
 | `--output`, `-o` | `<name>_anonymise.md` | Output file path |
-| `--ollama-url` | `http://localhost:11434` | Ollama API URL |
+| `--url` (alias `--ollama-url`) | `http://localhost:11434` (ollama), `http://localhost:1234` (lmstudio) | Engine API URL |
 | `--no-llm` | `false` | Regex-only mode (no LLM) |
 | `--chunk-size` | `1500` | Max characters per LLM chunk. Smaller = fewer missed entities at the end of a chunk, and faster (attention cost is quadratic) |
 | `--passes` | `2` | LLM passes: 1, 2, or 3 |
@@ -232,7 +256,8 @@ the interface:
 python lancer.py
 ```
 
-On Windows you can simply double-click `lancer.bat`.
+On Windows you can simply double-click `lancer.bat`; on macOS,
+`lancer.command` (LM Studio).
 
 Or start the interface alone (Ollama must already be running):
 
@@ -249,7 +274,7 @@ Features:
 - Bilingual interface (FR/EN toggle)
 - Drag & drop file upload
 - Custom words/names to anonymize (with persistent `sensitive-words.json` dictionary)
-- LLM model selector (auto-detects installed Ollama models)
+- LLM engine selector (Ollama / LM Studio) and model selector (auto-detects installed models)
 - Real-time progress bar with elapsed time
 - Stop button to cancel long-running anonymization
 - Image extraction from docx/pdf (saved as numbered files, downloadable as zip)
@@ -286,11 +311,36 @@ Vous voulez utiliser Claude, ChatGPT, ou tout autre IA cloud pour analyser vos d
 | 3 | **LLM local** | Passe de vérification — attrape les oublis de la passe 2 |
 | 4 | **LLM local** (optionnel) | Re-vérification stricte (`--passes 3`) |
 
-**Tout le traitement LLM se fait localement via Ollama. Aucune donnée n'est envoyée à un service externe.**
+**Tout le traitement LLM se fait localement via Ollama ou LM Studio. Aucune donnée n'est envoyée à un service externe.**
 
 ## Installation
 
-### 1. Installer Ollama
+### macOS : LM Studio
+
+1. Installer LM Studio depuis https://lmstudio.ai/download et l'ouvrir une
+   fois (cela installe la commande `lms` dans `~/.lmstudio/bin`).
+2. Télécharger un modèle : `lms get qwen/qwen3.5-9b` (ou depuis l'app).
+3. Double-cliquer sur `lancer.command`. Le premier lancement crée un
+   `.venv` et installe les dépendances Python ; ensuite il démarre le
+   serveur LM Studio (`lms server start`) et ouvre l'interface.
+
+Le CLI utilise LM Studio par défaut sur Mac (`--backend ollama` pour
+changer) :
+```bash
+.venv/bin/python anonymize.py document.docx
+```
+
+> Sur Apple Silicon, la mémoire est partagée entre CPU et GPU : la limite
+> de VRAM mesurée ci-dessous sur la machine Windows ne s'applique pas.
+> Mesuré sur Apple M5 (16 Go) avec `qwen/qwen3.5-9b`, document de 1,9 Ko,
+> 2 passes : **54 s, ~70 car./s par passe** (mistral sur le GPU 4 Go :
+> 25 car./s).
+>
+> Le mode *réflexion* du modèle est coupé par l'outil : laissé actif,
+> qwen3.5 passait 211 s à raisonner sur 150 caractères et rendait une
+> réponse vide.
+
+### 1. Installer Ollama (Windows/Linux)
 
 **Windows :** Télécharger depuis https://ollama.com/download
 
@@ -339,7 +389,8 @@ l'interface :
 python lancer.py
 ```
 
-Sous Windows, double-cliquez simplement sur `lancer.bat`.
+Sous Windows, double-cliquez simplement sur `lancer.bat` ; sur Mac, sur
+`lancer.command` (LM Studio).
 
 Ou l'interface seule (Ollama doit déjà tourner) :
 
@@ -357,7 +408,7 @@ Ouvre une interface dans le navigateur avec :
 - Interface bilingue (FR/EN)
 - Glisser-déposer de fichiers
 - Saisie de mots/noms personnalisés à anonymiser (avec dictionnaire persistant `sensitive-words.json`)
-- Sélection du modèle LLM (détection automatique des modèles Ollama installés)
+- Choix du moteur (Ollama / LM Studio) et du modèle (détection automatique des modèles installés)
 - Barre de progression en temps réel avec chronomètre
 - Bouton d'arrêt pour annuler un traitement long
 - Extraction d'images depuis docx/pdf (fichiers numérotés, téléchargeables en zip)
@@ -473,7 +524,7 @@ identifie un client aussi sûrement qu'un nom.
 python -m unittest discover -s tests -t .
 ```
 
-104 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama (les
+121 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama ni de LM Studio (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 

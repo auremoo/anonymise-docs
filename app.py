@@ -18,7 +18,9 @@ from anonymize import (
     read_file_bytes,
     run_pipeline,
     save_images,
-    check_ollama,
+    check_llm,
+    BACKENDS,
+    DEFAULT_BACKEND,
     load_sensitive_words,
     save_sensitive_words,
 )
@@ -42,14 +44,15 @@ TEXTS = {
     },
     "status": {"FR": "Statut", "EN": "Status"},
     "model_label": {"FR": "Modèle LLM", "EN": "LLM Model"},
+    "backend_label": {"FR": "Moteur LLM local", "EN": "Local LLM engine"},
     "model_help": {
-        "FR": "Sélectionnez le modèle Ollama à utiliser",
-        "EN": "Select the Ollama model to use",
+        "FR": "Sélectionnez le modèle {moteur} à utiliser",
+        "EN": "Select the {moteur} model to use",
     },
     "local_notice": {
-        "FR": "Tout le traitement se fait **localement** via Ollama.\n"
+        "FR": "Tout le traitement se fait **localement** via {moteur}.\n"
               "Aucune donnée n'est envoyée à un service externe.",
-        "EN": "All processing is done **locally** via Ollama.\n"
+        "EN": "All processing is done **locally** via {moteur}.\n"
               "No data is sent to any external service.",
     },
     "upload_label": {
@@ -119,18 +122,18 @@ TEXTS = {
         "EN": "Extract images from document (docx/pdf) into a separate "
               "folder with [IMAGE_N] placeholders",
     },
-    "ollama_warning": {
-        "FR": "Ollama n'est pas connecté. Activez 'Regex uniquement' ou "
-              "lancez `ollama serve`.",
-        "EN": "Ollama is not connected. Enable 'Regex only' or "
-              "run `ollama serve`.",
+    "engine_warning": {
+        "FR": "{moteur} n'est pas connecté. Activez 'Regex uniquement' ou "
+              "lancez `{demarrage}`.",
+        "EN": "{moteur} is not connected. Enable 'Regex only' or "
+              "run `{demarrage}`.",
     },
     "no_model_warning": {
-        "FR": "Ollama est lancé mais **aucun modèle n'est installé**. "
-              "Installez-en un avec `ollama pull mistral`, ou cochez "
+        "FR": "{moteur} est lancé mais **aucun modèle n'est installé**. "
+              "Installez-en un ({installation}), ou cochez "
               "« Regex uniquement » pour continuer sans LLM.",
-        "EN": "Ollama is running but **no model is installed**. "
-              "Install one with `ollama pull mistral`, or check "
+        "EN": "{moteur} is running but **no model is installed**. "
+              "Install one ({installation}), or check "
               "\"Regex only\" to continue without an LLM.",
     },
     "no_model_status": {
@@ -146,9 +149,9 @@ TEXTS = {
     },
     "cancelling": {
         "FR": "Arrêt demandé — le bloc en cours doit d'abord revenir "
-              "d'Ollama, cela peut prendre plusieurs minutes. "
+              "du moteur LLM, cela peut prendre plusieurs minutes. "
               "Inutile de recliquer.",
-        "EN": "Stop requested — the chunk already sent to Ollama must "
+        "EN": "Stop requested — the chunk already sent to the LLM must "
               "come back first, which can take several minutes. "
               "No need to click again.",
     },
@@ -339,29 +342,35 @@ def _valider_json_dico(texte: str):
 
 
 @st.cache_data(ttl=15, show_spinner=False)
-def cached_check_ollama(url: str, model: str):
-    """check_ollama() mis en cache 15 s.
+def cached_check_llm(backend: str, url: str, model: str):
+    """check_llm() mis en cache 15 s.
 
     La sidebar est re-rendue a chaque interaction et a chaque tick de la
     boucle de progression : sans cache, chaque rerun declenche un appel
-    HTTP a Ollama.
+    HTTP au moteur LLM.
     """
-    return check_ollama(url, model)
+    return check_llm(backend, url, model)
 
 
-def t(key: str) -> str:
+def t(key: str, **valeurs) -> str:
     """Get translated string for current language."""
     lang = st.session_state.get("lang", "FR")
     entry = TEXTS.get(key, {})
-    return entry.get(lang, entry.get("FR", key))
+    texte = entry.get(lang, entry.get("FR", key))
+    return texte.format(**valeurs) if valeurs else texte
 
 
 # =============================================================================
 # CONFIG
 # =============================================================================
 
-OLLAMA_URL = "http://localhost:11434"
-DEFAULT_MODEL = "mistral:latest"
+# Commandes suggérées quand le moteur est absent ou vide.
+AIDE_MOTEUR = {
+    "ollama": {"demarrage": "ollama serve",
+               "installation": "`ollama pull mistral`"},
+    "lmstudio": {"demarrage": "lms server start",
+                 "installation": "`lms get qwen/qwen3.5-9b`"},
+}
 OUTPUT_DIR = Path(__file__).resolve().parent / "output"
 
 CATEGORIES = [
@@ -433,13 +442,27 @@ with st.sidebar:
 
     st.header(t("status"))
 
-    # Check Ollama + get available models
-    connected, msg, available_models = cached_check_ollama(
-        OLLAMA_URL, DEFAULT_MODEL
+    backends = list(BACKENDS)
+    backend = st.radio(
+        t("backend_label"),
+        backends,
+        index=backends.index(DEFAULT_BACKEND),
+        format_func=lambda b: BACKENDS[b]["nom"],
+        horizontal=True,
+        disabled=pipe["running"],
+        key="backend_radio",
+    )
+    MOTEUR = BACKENDS[backend]["nom"]
+    LLM_URL = BACKENDS[backend]["url"]
+    DEFAULT_MODEL = BACKENDS[backend]["modele"]
+
+    # Check engine + get available models
+    connected, msg, available_models = cached_check_llm(
+        backend, LLM_URL, DEFAULT_MODEL
     )
 
     if connected and not available_models:
-        # Ollama répond mais n'a aucun modèle : inutilisable pour le LLM.
+        # Le moteur répond mais n'a aucun modèle : inutilisable pour le LLM.
         st.error(f"\U0001f534 {t('no_model_status')}")
     elif connected and DEFAULT_MODEL in " ".join(available_models):
         st.success(f"\U0001f7e2 {msg}")
@@ -459,14 +482,14 @@ with st.sidebar:
             t("model_label"),
             options=available_models,
             index=default_idx,
-            help=t("model_help"),
+            help=t("model_help", moteur=MOTEUR),
         )
     else:
         selected_model = DEFAULT_MODEL
         st.caption(f"Model: {DEFAULT_MODEL}")
 
     st.divider()
-    st.caption(t("local_notice"))
+    st.caption(t("local_notice", moteur=MOTEUR))
 
 # =============================================================================
 # MAIN
@@ -692,15 +715,17 @@ with col4:
 st.divider()
 
 can_run = uploaded_file is not None and not pipe["running"]
-# Le LLM est demandé : il faut Ollama joignable ET au moins un modèle
-# installé. Sans ce second test, un Ollama vide laissait lancer un run
+# Le LLM est demandé : il faut le moteur joignable ET au moins un modèle
+# installé. Sans ce second test, un moteur vide laissait lancer un run
 # qui échouait sur tous les chunks.
 if not no_llm:
     if not connected:
-        st.warning(t("ollama_warning"))
+        st.warning(t("engine_warning", moteur=MOTEUR,
+                     **AIDE_MOTEUR[backend]))
         can_run = False
     elif not available_models:
-        st.warning(t("no_model_warning"))
+        st.warning(t("no_model_warning", moteur=MOTEUR,
+                     **AIDE_MOTEUR[backend]))
         can_run = False
 
 btn_col1, btn_col2 = st.columns([3, 1])
@@ -725,8 +750,9 @@ with btn_col2:
 if stop_clicked:
     st.session_state.cancel_flag.set()
     # L'annulation est vérifiée ENTRE les chunks : le chunk déjà parti
-    # chez Ollama doit d'abord revenir. Sans ce marqueur, le clic semblait
-    # sans effet pendant plusieurs minutes et l'utilisateur recliquait.
+    # chez le moteur LLM doit d'abord revenir. Sans ce marqueur, le clic
+    # semblait sans effet pendant plusieurs minutes et l'utilisateur
+    # recliquait.
     pipe["cancelling"] = True
 
 # ── Start pipeline (background thread) ──────────────────────
@@ -769,6 +795,8 @@ if run_clicked:
     _custom_words = custom_words if custom_words else None
     _use_llm = not no_llm
     _model = selected_model
+    _backend = backend
+    _llm_url = LLM_URL
     _passes = passes
     _filename_stem = filename_stem
     _deep_analysis = deep_analysis
@@ -806,7 +834,8 @@ if run_clicked:
                 custom_words=_custom_words,
                 use_llm=_use_llm,
                 model=_model,
-                ollama_url=OLLAMA_URL,
+                llm_url=_llm_url,
+                backend=_backend,
                 passes=_passes,
                 on_progress=on_progress,
                 cancel_flag=_cancel_flag,
@@ -958,7 +987,7 @@ if pipe["result"] is not None:
         st.error(
             f"LLM: {stats['llm_erreurs']} erreur(s) — "
             "certains chunks n'ont pas été traités par le LLM. "
-            "Vérifiez qu'Ollama est lancé et que le modèle répond."
+            f"Vérifiez que {MOTEUR} est lancé et que le modèle répond."
         )
 
     if stats.get("llm_no_change", 0) > 0:

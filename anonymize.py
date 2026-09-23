@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # Anonymize Docs — Auteur : Aurélien Moote - Moo - 2026 — Licence MIT
 """
-Pipeline d'anonymisation hybride v2 : Regex + LLM local (Ollama /api/chat)
+Pipeline d'anonymisation hybride v2 : Regex + LLM local
+(Ollama /api/chat ou LM Studio /v1/chat/completions)
 Usage CLI  : python anonymize.py <fichier> [--output fichier_sortie.md]
 Usage Web  : streamlit run app.py
 
@@ -10,6 +11,7 @@ Dépendances :
 """
 
 import io
+import os
 import re
 import sys
 import json
@@ -523,7 +525,7 @@ class RegexAnonymizer:
 
 
 # =============================================================================
-# PASSE 2 + 3 : LLM via Ollama /api/chat
+# PASSE 2 + 3 : LLM local (Ollama ou LM Studio)
 # =============================================================================
 
 SYSTEM_PROMPT_PASS2 = """Tu es un outil d'anonymisation de documents techniques (industriel, IT/OT, cybersécurité). Remplace les entités nommées par des tags. Ne fais RIEN d'autre.
@@ -662,20 +664,119 @@ def call_ollama_chat(text: str, system_prompt: str, model: str = "mistral:latest
         )
         response.raise_for_status()
         data = response.json()
-        result = data.get("message", {}).get("content", "")
-        if not result.strip():
+        result = _nettoyer_reponse(data.get("message", {}).get("content", ""))
+        if not result:
             return text, False
-        result = result.strip()
-        # Strip markdown code blocks that some models wrap around output
-        if result.startswith("```") and result.endswith("```"):
-            lines = result.split("\n")
-            if len(lines) >= 3:
-                result = "\n".join(lines[1:-1]).strip()
         return result, True
     except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
         return text, False
     except Exception:
         return text, False
+
+
+def _nettoyer_reponse(result: str) -> str:
+    """Retire ce qu'un modèle ajoute autour du texte anonymisé."""
+    # Certains modèles de raisonnement laissent leur réflexion dans le
+    # contenu au lieu de la séparer : elle ne doit pas finir dans le
+    # document.
+    result = re.sub(r"<think>.*?</think>", "", result, flags=re.DOTALL)
+    result = result.strip()
+    if result.startswith("```") and result.endswith("```"):
+        lines = result.split("\n")
+        if len(lines) >= 3:
+            result = "\n".join(lines[1:-1]).strip()
+    return result
+
+
+def call_lmstudio_chat(text: str, system_prompt: str,
+                       model: str = "qwen/qwen3.5-9b",
+                       base_url: str = "http://localhost:1234",
+                       timeout: int = 900) -> tuple[str, bool]:
+    """Appel LM Studio via son API compatible OpenAI.
+
+    Différences avec Ollama : la taille de contexte est fixée au
+    chargement du modèle dans LM Studio (pas de num_ctx par requête), et
+    num_predict devient max_tokens.
+    """
+    if not HAS_REQUESTS:
+        return text, False
+    _, max_tokens = _size_context(system_prompt, text)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Anonymise ce texte :\n\n{text}"},
+        ],
+        "stream": False,
+        "temperature": 0.05,
+        "top_p": 0.9,
+        "max_tokens": max_tokens,
+    }
+    # Réflexion coupée. Mesuré avec qwen3.5-9b sur 150 caractères :
+    # réflexion active = 3000 tokens de raisonnement en 211 s, réponse
+    # VIDE (budget épuisé avant d'écrire) ; réflexion coupée = 4,7 s et
+    # un résultat correct. gpt-oss ne connaît pas « none » : son niveau
+    # est déjà donné par « Reasoning: low » dans le prompt système.
+    if "gpt-oss" not in model.lower():
+        payload["reasoning_effort"] = "none"
+    try:
+        response = _SESSION.post(f"{base_url}/v1/chat/completions",
+                                 json=payload, timeout=timeout)
+        if (response.status_code == 400
+                and "reasoning_effort" in payload):
+            # Modèle ou version de LM Studio qui refuse le paramètre :
+            # on retente sans plutôt que de perdre le chunk.
+            del payload["reasoning_effort"]
+            response = _SESSION.post(f"{base_url}/v1/chat/completions",
+                                     json=payload, timeout=timeout)
+        response.raise_for_status()
+        choix = response.json().get("choices") or [{}]
+        # Réponse coupée par max_tokens : la fin du chunk manque. Si la
+        # coupure tombe au-delà de 60 %, le garde-fou d'intégrité la
+        # laisserait passer et la fin du texte disparaîtrait du document.
+        if choix[0].get("finish_reason") == "length":
+            return text, False
+        result = _nettoyer_reponse(
+            (choix[0].get("message") or {}).get("content") or "")
+        if not result:
+            return text, False
+        return result, True
+    except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
+        return text, False
+    except Exception:
+        return text, False
+
+
+# Moteurs LLM locaux pris en charge. Même contrat pour les deux : texte en
+# entrée, (texte, succès) en sortie ; tout le reste du pipeline est commun.
+BACKENDS = {
+    "ollama": {
+        "nom": "Ollama",
+        "url": "http://localhost:11434",
+        "modele": "mistral:latest",
+    },
+    "lmstudio": {
+        "nom": "LM Studio",
+        "url": "http://localhost:1234",
+        "modele": "qwen/qwen3.5-9b",
+    },
+}
+# Sur Mac, LM Studio ; ailleurs, Ollama comme avant. Le lanceur peut
+# imposer son choix (--backend) via la variable d'environnement.
+DEFAULT_BACKEND = os.environ.get("ANONYMISE_BACKEND") or (
+    "lmstudio" if sys.platform == "darwin" else "ollama")
+if DEFAULT_BACKEND not in BACKENDS:
+    DEFAULT_BACKEND = "ollama"
+
+
+def call_llm_chat(text: str, system_prompt: str, model: str,
+                  base_url: str, timeout: int = 900,
+                  backend: str = "ollama") -> tuple[str, bool]:
+    if backend == "lmstudio":
+        return call_lmstudio_chat(text, system_prompt, model=model,
+                                  base_url=base_url, timeout=timeout)
+    return call_ollama_chat(text, system_prompt, model=model,
+                            base_url=base_url, timeout=timeout)
 
 
 # =============================================================================
@@ -1157,17 +1258,59 @@ def check_ollama(
         return False, f"Erreur Ollama : {e}", []
 
 
+def check_lmstudio(
+    base_url: str = "http://localhost:1234",
+    model: str = "qwen/qwen3.5-9b",
+) -> tuple[bool, str, list[str]]:
+    """Vérifie le serveur LM Studio et liste ses modèles de chat.
+
+    LM Studio liste aussi ses modèles d'embedding, incapables de
+    répondre à un chat : son API native (/api/v0) donne le type de chaque
+    modèle, ce qui permet de les écarter. Repli sur /v1/models si cette
+    API n'existe pas dans la version installée.
+    """
+    if not HAS_REQUESTS:
+        return False, "Module 'requests' non installé", []
+    try:
+        try:
+            r = requests.get(f"{base_url}/api/v0/models", timeout=5)
+            r.raise_for_status()
+            models = [m["id"] for m in r.json().get("data", [])
+                      if m.get("type") in ("llm", "vlm")]
+        except requests.exceptions.HTTPError:
+            r = requests.get(f"{base_url}/v1/models", timeout=5)
+            r.raise_for_status()
+            models = [m["id"] for m in r.json().get("data", [])
+                      if "embed" not in m["id"].lower()]
+        if any(model in m for m in models):
+            return True, f"LM Studio connecté — {model} prêt", models
+        return True, f"LM Studio connecté — {model} NON trouvé", models
+    except requests.exceptions.ConnectionError:
+        return False, ("LM Studio non joignable — lance "
+                       "'lms server start'"), []
+    except Exception as e:
+        return False, f"Erreur LM Studio : {e}", []
+
+
+def check_llm(backend: str, base_url: str,
+              model: str) -> tuple[bool, str, list[str]]:
+    if backend == "lmstudio":
+        return check_lmstudio(base_url, model)
+    return check_ollama(base_url, model)
+
+
 # =============================================================================
 # PIPELINE PRINCIPAL
 # =============================================================================
 
-def _run_llm_pass(chunks, system_prompt, pass_name, log, model, ollama_url,
+def _run_llm_pass(chunks, system_prompt, pass_name, log, model, llm_url,
                   timeout, cancel_flag, on_progress,
-                  done_chunks_ref, total_chunks, parallel: int = 1):
+                  done_chunks_ref, total_chunks, parallel: int = 1,
+                  backend: str = "ollama"):
     """Execute one LLM pass on a list of chunks. Returns result list.
 
-    Les chunks sont indépendants (chacun est un appel /api/chat isolé), donc
-    `parallel` > 1 les envoie de front. Si Ollama ne sert qu'un slot
+    Les chunks sont indépendants (chacun est un appel de chat isolé), donc
+    `parallel` > 1 les envoie de front. Si le moteur ne sert qu'un slot
     (OLLAMA_NUM_PARALLEL=1) les requêtes sont simplement mises en file :
     aucun risque, juste aucun gain.
     """
@@ -1194,9 +1337,10 @@ def _run_llm_pass(chunks, system_prompt, pass_name, log, model, ollama_url,
             f"  {pass_name} [{i}/{n}] ({len(chunk)} chars)...",
             progress=progress,
         )
-        result, success = call_ollama_chat(
+        result, success = call_llm_chat(
             chunk, system_prompt,
-            model=model, base_url=ollama_url, timeout=timeout,
+            model=model, base_url=llm_url, timeout=timeout,
+            backend=backend,
         )
         if success:
             # Garde-fou d'intégrité : un petit modèle peut réécrire le
@@ -1269,7 +1413,7 @@ def run_pipeline(
     custom_words: dict[str, str] | None = None,
     use_llm: bool = True,
     model: str = "mistral:latest",
-    ollama_url: str = "http://localhost:11434",
+    llm_url: str | None = None,
     chunk_size: int = 1500,
     passes: int = 2,
     timeout: int = 900,
@@ -1280,12 +1424,15 @@ def run_pipeline(
     deep_analysis: bool = False,
     parallel: int = 1,
     verbose: bool = True,
+    backend: str = "ollama",
 ) -> dict:
     """
     Execute the full anonymization pipeline.
     Returns {text, mapping, report, warnings, stats}.
     """
     log = Logger(on_progress=on_progress, verbose=verbose)
+    moteur = BACKENDS[backend]["nom"]
+    llm_url = llm_url or BACKENDS[backend]["url"]
     log.stats["fichier_source"] = filename
     log.stats["taille_originale"] = len(text)
 
@@ -1342,12 +1489,12 @@ def run_pipeline(
     if use_llm and not cancelled:
         log.log(
             "LLM",
-            f"Test connexion Ollama ({ollama_url})...",
+            f"Test connexion {moteur} ({llm_url})...",
             progress=0.15,
         )
-        connected, msg, _ = check_ollama(ollama_url, model)
+        connected, msg, _ = check_llm(backend, llm_url, model)
         if not connected:
-            log.log("ERROR", f"Ollama : {msg}")
+            log.log("ERROR", f"{moteur} : {msg}")
             log.log("WARN", "Fallback regex uniquement.")
             use_llm = False
 
@@ -1372,7 +1519,7 @@ def run_pipeline(
         prompt_p2 = reasoning_prefix + SYSTEM_PROMPT_PASS2
         prompt_p3 = reasoning_prefix + SYSTEM_PROMPT_PASS3
 
-        log.log("OK", f"Ollama OK — {model} (analyse {mode_label}).",
+        log.log("OK", f"{moteur} OK — {model} (analyse {mode_label}).",
                 progress=0.18)
         chunks = split_into_chunks(text, chunk_size)
         total_chunks = len(chunks) * min(passes, 3)
@@ -1380,9 +1527,9 @@ def run_pipeline(
 
         # Passe 2
         result_chunks = _run_llm_pass(
-            chunks, prompt_p2, "Passe 2", log, model, ollama_url,
+            chunks, prompt_p2, "Passe 2", log, model, llm_url,
             timeout, cancel_flag, on_progress, done_ref, total_chunks,
-            parallel=parallel,
+            parallel=parallel, backend=backend,
         )
         text = "\n\n".join(result_chunks)
 
@@ -1391,8 +1538,8 @@ def run_pipeline(
             chunks2 = split_into_chunks(text, chunk_size)
             result_chunks2 = _run_llm_pass(
                 chunks2, prompt_p3, "Passe 3 vérif", log, model,
-                ollama_url, timeout, cancel_flag, on_progress,
-                done_ref, total_chunks, parallel=parallel,
+                llm_url, timeout, cancel_flag, on_progress,
+                done_ref, total_chunks, parallel=parallel, backend=backend,
             )
             text = "\n\n".join(result_chunks2)
 
@@ -1401,8 +1548,8 @@ def run_pipeline(
             chunks3 = split_into_chunks(text, chunk_size)
             result_chunks3 = _run_llm_pass(
                 chunks3, prompt_p3, "Passe 4 strict", log, model,
-                ollama_url, timeout, cancel_flag, on_progress,
-                done_ref, total_chunks, parallel=parallel,
+                llm_url, timeout, cancel_flag, on_progress,
+                done_ref, total_chunks, parallel=parallel, backend=backend,
             )
             text = "\n\n".join(result_chunks3)
 
@@ -1421,7 +1568,7 @@ def run_pipeline(
     warnings += check_tags_colles(text)
     warnings += check_fragments_numeriques(text)
 
-    # Un chunk dont l'appel LLM a échoué (timeout, Ollama surchargé) est
+    # Un chunk dont l'appel LLM a échoué (timeout, moteur LLM surchargé) est
     # conservé TEL QUEL : le document de sortie contient alors encore les
     # noms, sociétés et lieux de cette portion. C'était jusqu'ici une simple
     # métrique dans le rapport — pour un outil d'anonymisation, ça doit être
@@ -1429,7 +1576,7 @@ def run_pipeline(
     if log.stats["llm_erreurs"] > 0:
         warnings.insert(0, (
             f"⚠️ {log.stats['llm_erreurs']} chunk(s) NON traité(s) par le LLM "
-            "(timeout ou Ollama indisponible) : ces portions sont restées "
+            "(timeout ou moteur LLM indisponible) : ces portions sont restées "
             "en clair et peuvent encore contenir des noms, sociétés ou lieux. "
             "NE PAS partager ce document sans relecture — augmentez --timeout "
             "ou utilisez un modèle plus léger."
@@ -1503,26 +1650,39 @@ def run_pipeline(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Anonymisation hybride (Regex + LLM Ollama, multi-passe)",
+        description="Anonymisation hybride (Regex + LLM local, multi-passe)",
         epilog="""
 Exemples :
   python anonymize.py cahier_des_charges.docx
   python anonymize.py rapport.pdf --model gpt-oss:120b
   python anonymize.py notes.md -o anonyme.md --no-llm
-  python anonymize.py spec.docx --passes 3 --chunk-size 2000""",
+  python anonymize.py spec.docx --passes 3 --chunk-size 2000
+  python anonymize.py spec.docx --backend lmstudio --model qwen/qwen3.5-9b""",
         formatter_class=argparse.RawDescriptionHelpFormatter
     )
     parser.add_argument("fichier", help="Fichier à anonymiser")
-    parser.add_argument("--model", default="mistral:latest", help="Modèle Ollama")
+    parser.add_argument(
+        "--backend", choices=sorted(BACKENDS), default=DEFAULT_BACKEND,
+        help=f"Moteur LLM local (defaut sur cette machine : {DEFAULT_BACKEND})",
+    )
+    parser.add_argument(
+        "--model",
+        help="Modele LLM (defaut : mistral:latest pour ollama, "
+             "qwen/qwen3.5-9b pour lmstudio)",
+    )
     parser.add_argument("--output", "-o", help="Fichier de sortie")
-    parser.add_argument("--ollama-url", default="http://localhost:11434")
+    parser.add_argument(
+        "--url", "--ollama-url", dest="url",
+        help="URL du moteur (defaut : http://localhost:11434 pour ollama, "
+             "http://localhost:1234 pour lmstudio)",
+    )
     parser.add_argument("--no-llm", action="store_true",
                         help="Regex uniquement")
     parser.add_argument("--chunk-size", type=int, default=1500)
     parser.add_argument("--passes", type=int, default=2, choices=[1, 2, 3])
     parser.add_argument(
         "--timeout", type=int, default=900,
-        help="Delai max par requete Ollama (defaut 900 s). A 300 s, "
+        help="Delai max par requete LLM (defaut 900 s). A 300 s, "
              "7 chunks sur 254 ont expire sur un document reel et sont "
              "sortis EN CLAIR.",
     )
@@ -1533,7 +1693,7 @@ Exemples :
     )
     parser.add_argument(
         "--parallel", type=int, default=1, metavar="N",
-        help="Chunks envoyes en parallele a Ollama (defaut 1). "
+        help="Chunks envoyes en parallele au moteur LLM (defaut 1). "
              "Au-dela de 1, chaque slot Ollama reclame son propre cache "
              "KV : sur un GPU a faible VRAM cela chasse le modele vers le "
              "CPU et ralentit chaque chunk. Mesure sur 254 chunks reels : "
@@ -1575,8 +1735,10 @@ Exemples :
     result = run_pipeline(
         text=text, filename=filepath.name,
         custom_words=dict_words if dict_words else None,
-        use_llm=not args.no_llm, model=args.model,
-        ollama_url=args.ollama_url, chunk_size=args.chunk_size,
+        use_llm=not args.no_llm,
+        model=args.model or BACKENDS[args.backend]["modele"],
+        backend=args.backend,
+        llm_url=args.url, chunk_size=args.chunk_size,
         passes=args.passes, timeout=args.timeout,
         images_count=len(images),
         images_folder=images_folder_name,

@@ -11,11 +11,13 @@ jamais écrire dans le `sensitive-words.json` de l'utilisateur.
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests.outils import RACINE
 import anonymize
 
 try:
+    import streamlit as st
     from streamlit.testing.v1 import AppTest
     A_STREAMLIT = True
 except ImportError:
@@ -28,6 +30,14 @@ APP = str(RACINE / "app.py")
 class TestEditeurJson(unittest.TestCase):
 
     def setUp(self):
+        # Moteur LLM simulé : sans lui, l'état de la machine (moteur
+        # lancé ou non) s'affichait en erreur dans la sidebar et faisait
+        # échouer les tests qui vérifient l'absence d'erreur.
+        patch = mock.patch.object(anonymize, "check_llm",
+                                  return_value=(True, "ok", ["modele"]))
+        patch.start()
+        self.addCleanup(patch.stop)
+        st.cache_data.clear()
         self._tmp = tempfile.TemporaryDirectory()
         self._dict_origine = anonymize.DICT_PATH
         anonymize.DICT_PATH = Path(self._tmp.name) / "dico.json"

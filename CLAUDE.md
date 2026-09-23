@@ -2,7 +2,7 @@
 
 ## Description
 
-Pipeline d'anonymisation hybride (Regex + LLM local Ollama) pour nettoyer des documents sensibles avant de les envoyer à des IA cloud (Claude, ChatGPT, etc.).
+Pipeline d'anonymisation hybride (Regex + LLM local — Ollama, ou LM Studio sur Mac) pour nettoyer des documents sensibles avant de les envoyer à des IA cloud (Claude, ChatGPT, etc.).
 
 **Domaine principal** : documents techniques industriels (SCADA, OT, cybersécurité industrielle, cahiers des charges, spécifications techniques).
 
@@ -48,6 +48,9 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | `load_sensitive_words()` / `save_sensitive_words()` | Chargement/sauvegarde du dictionnaire persistant `sensitive-words.json` |
 | `RegexAnonymizer` | Passe 1 — patterns structurés (IP, email, dates, FQDN, chemins, téléphones, credentials) |
 | `call_ollama_chat()` | Appel Ollama via `/api/chat` avec system prompt — session HTTP réutilisée, `keep_alive: 10m` |
+| `call_lmstudio_chat()` | Appel LM Studio via `/v1/chat/completions` (API OpenAI). Réflexion coupée (`reasoning_effort: none`, sauf gpt-oss), `finish_reason: length` traité comme un échec, `<think>` retiré |
+| `call_llm_chat()` / `check_llm()` | Aiguillage selon `backend` (`ollama` / `lmstudio`) — `BACKENDS` donne nom, URL et modèle par défaut |
+| `check_lmstudio()` | Liste les modèles de chat via `/api/v0/models` (écarte les modèles d'embedding), repli `/v1/models` |
 | `_size_context()` | Calcule `num_ctx`/`num_predict` selon la taille du chunk (évite d'allouer 32k tokens de cache KV pour 4k caractères) |
 | `split_into_chunks()` | Découpage intelligent (paragraphes > lignes) |
 | `post_check()` | Vérification finale regex pour patterns résiduels |
@@ -59,11 +62,16 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | `_read_pdf_with_images()` | Extraction images PDF via pymupdf (`page.get_images()` + `doc.extract_image()`) |
 | `check_ollama()` | Vérifie connexion Ollama et disponibilité modèle, retourne la liste des modèles |
 
+`DEFAULT_BACKEND` vaut `lmstudio` sur macOS, `ollama` ailleurs ; le
+lanceur l'impose via la variable `ANONYMISE_BACKEND`. `run_pipeline()`
+garde `backend="ollama"` par défaut (les tests simulent `check_ollama`).
+
 ### Interface Streamlit (`app.py`)
 
 | Composant | Rôle |
 |-----------|------|
-| Language toggle | Radio FR/EN dans la sidebar, toutes les chaînes via `t("key")` |
+| Language toggle | Radio FR/EN dans la sidebar, toutes les chaînes via `t("key")` (paramètres nommés : `t("key", moteur=...)`) |
+| Engine selector | Radio Ollama / LM Studio, défaut `DEFAULT_BACKEND` |
 | Model selector | Selectbox peuplé par `check_ollama()` (modèles installés) |
 | File uploader | Drag & drop de documents (disabled pendant l'exécution) |
 | Data editor | Tableau dynamique de mots custom à anonymiser (pré-rempli depuis `sensitive-words.json`) |
@@ -86,9 +94,32 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 ## Stack technique
 
 - **Python 3.10+**
-- **Ollama** — runtime LLM local (`http://localhost:11434`)
-- **Modèle par défaut** : `mistral:latest` (sélectionnable dans l'UI)
+- **Ollama** — runtime LLM local (`http://localhost:11434`), Windows/Linux
+- **LM Studio** — runtime LLM local (`http://localhost:1234`), macOS — démarré par `lms server start`
+- **Modèle par défaut** : `mistral:latest` (Ollama), `qwen/qwen3.5-9b` (LM Studio) — sélectionnable dans l'UI
 - **Chunk par défaut** : 1500 caractères (voir mesures ci-dessous)
+
+### Mac Apple Silicon + LM Studio — mesuré sur M5 (16 Go)
+
+Mémoire unifiée : la contrainte de VRAM ci-dessous ne s'applique pas,
+`qwen/qwen3.5-9b` (Q4_K_M, 6,5 Go) tourne entièrement sur le GPU.
+
+| Mesure | Valeur |
+|---|---|
+| Réflexion **active** (défaut du modèle), 150 car. | 3000 tokens de raisonnement, 211 s, **réponse vide** → chunk en clair |
+| Réflexion coupée, même texte | 4,7 s, résultat correct (`S7-1500`, `TGBT` préservés) |
+| Document de 1,9 Ko, 2 passes | 54 s — **~70 car./s par passe** (mistral sur le PC : 25) |
+
+Sur ce document (sans dictionnaire, n=1) : 10/10 personnes, sociétés,
+lieux et nom de projet tagués, 16/16 termes techniques préservés. Mais `DV2601659`,
+`DOC-B-123`, `PR-QSE-07`, `REF-INT-2024-88` **restés en clair** (mistral
+attrapait les deux premiers), et `bâtiment B2V` tagué `[LIEU_4]`. La
+numérotation par chunk produit des collisions réelles : « Beltech » est
+`[ENTREPRISE_2]` dans le chunk 1 et `[ENTREPRISE_1]` dans le chunk 2.
+Conclusion inchangée : les références vont dans le dictionnaire.
+
+La réflexion doit rester coupée : c'est `call_lmstudio_chat()` qui
+l'impose, pas un réglage de LM Studio.
 
 ### Contrainte matérielle — mesuré sur RTX 500 Ada (4 Go de VRAM)
 
@@ -390,8 +421,8 @@ n'anonymisait rien du tout.
 python -m unittest discover -s tests -t .
 ```
 
-104 tests, sans dépendance externe et sans Ollama (les appels LLM sont
-simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
+121 tests, sans dépendance externe, sans Ollama ni LM Studio (les appels
+LLM sont simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.
 
@@ -401,7 +432,8 @@ document sensible par accident.
 | `test_dictionnaire.py` | Passe 0 — casse, joker `*`, tags fantômes, fichier de dictionnaire |
 | `test_extraction.py` | docx/pdf — correspondance placeholder ↔ fichier vérifiée **par la couleur des pixels** (un simple comptage ne détecte pas un décalage de numérotation) |
 | `test_garde_fous.py` | Rejet d'intégrité, catégories inventées, chunks non traités, annulation, ordre des chunks en parallèle |
-| `test_interface_json.py` | Éditeur JSON de l'UI, exécuté via `AppTest` de Streamlit (saisie → clic → écriture → relecture) |
+| `test_interface_json.py` | Éditeur JSON de l'UI, exécuté via `AppTest` de Streamlit (saisie → clic → écriture → relecture). `check_llm` y est simulé : sinon l'état du moteur sur la machine faisait échouer les tests |
+| `test_lmstudio.py` | Backend LM Studio — format de requête, réflexion coupée, réponse tronquée/vide, repli sans `reasoning_effort`, filtrage des embeddings, aiguillage du pipeline |
 
 `run_pipeline(..., verbose=False)` coupe l'affichage console tout en
 gardant le journal complet dans le rapport.
@@ -409,9 +441,11 @@ gardant le journal complet dans le rapport.
 ## Commandes fréquentes
 
 ```bash
-# Lanceur tout-en-un (demarre Ollama si besoin + interface web)
+# Lanceur tout-en-un (demarre le moteur LLM si besoin + interface web)
 python lancer.py
-# ou double-clic sur lancer.bat
+# ou double-clic sur lancer.bat (Windows, Ollama)
+# ou double-clic sur lancer.command (Mac, LM Studio — cree .venv au 1er lancement)
+python lancer.py --backend ollama   # forcer le moteur
 
 # Lanceur sans interface (demarre seulement Ollama)
 python lancer.py --no-web
@@ -421,6 +455,13 @@ python -m streamlit run app.py
 
 # CLI — usage standard (avec extraction d'images)
 python anonymize.py document.docx
+
+# CLI — LM Studio (defaut sur Mac)
+.venv/bin/python anonymize.py document.docx --backend lmstudio --model qwen/qwen3.5-9b
+
+# Serveur LM Studio
+~/.lmstudio/bin/lms server start
+~/.lmstudio/bin/lms ps   # modele charge + contexte
 
 # CLI — regex seul (rapide, sans LLM)
 python anonymize.py document.docx --no-llm
