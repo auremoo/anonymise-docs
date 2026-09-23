@@ -49,6 +49,10 @@ You want to use Claude, ChatGPT, or any cloud AI to analyze your documents — b
 | `<name>_rapport.md` | Detailed anonymization report with stats | Optional — useful for audit |
 | `<name>_images/` | Extracted images (IMAGE_1.png, IMAGE_2.jpg...) | **Review first** — check for sensitive content |
 
+The web interface writes each document into its own folder,
+`output/<name>/`, so outputs of several documents never mix. The CLI
+writes next to the source file.
+
 ### Image extraction
 
 The `[IMAGE_N]` placeholder left in the text and the `IMAGE_N.ext` file on
@@ -509,6 +513,10 @@ identifie un client aussi sûrement qu'un nom.
 | `*_rapport.md` | Rapport détaillé de l'anonymisation | Optionnel |
 | `*_images/` | Images extraites (IMAGE_1.png, IMAGE_2.jpg...) | **À vérifier** — contrôlez le contenu sensible |
 
+L'interface web range chaque document dans son propre dossier,
+`output/<nom>/` : les sorties de plusieurs documents ne se mélangent
+plus. Le CLI écrit à côté du fichier source.
+
 ## Workflow typique
 
 ```
@@ -524,7 +532,7 @@ identifie un client aussi sûrement qu'un nom.
 python -m unittest discover -s tests -t .
 ```
 
-121 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama ni de LM Studio (les
+129 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama ni de LM Studio (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 

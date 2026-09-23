@@ -5,6 +5,7 @@ Lancement : streamlit run app.py
 """
 
 import io
+import os
 import json
 import time
 import zipfile
@@ -17,7 +18,7 @@ from anonymize import (
     read_file_bytes_with_images,
     read_file_bytes,
     run_pipeline,
-    save_images,
+    ecrire_sorties,
     check_llm,
     BACKENDS,
     DEFAULT_BACKEND,
@@ -193,6 +194,14 @@ TEXTS = {
     "previous_files_title": {
         "FR": "Fichiers déjà produits (dossier output/)",
         "EN": "Files already produced (output/ folder)",
+    },
+    "previous_images": {
+        "FR": "{n} image(s) extraite(s), dans {dossier}",
+        "EN": "{n} extracted image(s), in {dossier}",
+    },
+    "previous_loose_files": {
+        "FR": "Anciens fichiers, à la racine de output/",
+        "EN": "Older files, at the root of output/",
     },
     "previous_files_caption": {
         "FR": "Tout traitement terminé écrit ses fichiers ici, même si "
@@ -371,7 +380,28 @@ AIDE_MOTEUR = {
     "lmstudio": {"demarrage": "lms server start",
                  "installation": "`lms get qwen/qwen3.5-9b`"},
 }
-OUTPUT_DIR = Path(__file__).resolve().parent / "output"
+# Redirigeable pour les tests, qui ne doivent pas écrire dans le vrai
+# dossier output/ de l'utilisateur.
+OUTPUT_DIR = Path(
+    os.environ.get("ANONYMISE_OUTPUT_DIR")
+    or Path(__file__).resolve().parent / "output"
+)
+
+
+def date_dossier(dossier: Path) -> float:
+    """Date du fichier le plus récent du dossier.
+
+    Celle du dossier lui-même ne bouge pas quand on réécrit un fichier
+    existant : retraiter un document ne le faisait pas remonter en tête.
+    """
+    return max((f.stat().st_mtime for f in visibles(dossier)),
+               default=dossier.stat().st_mtime)
+
+
+def visibles(dossier: Path) -> list[Path]:
+    """Contenu d'un dossier, sans les fichiers cachés (.DS_Store du Finder,
+    qui apparaissait sinon parmi les fichiers produits)."""
+    return [f for f in dossier.iterdir() if not f.name.startswith(".")]
 
 CATEGORIES = [
     "PERSONNE", "ENTREPRISE", "SITE", "PROJET", "PROCESS",
@@ -845,24 +875,9 @@ if run_clicked:
             )
             _pipe["result"] = result
 
-            # Auto-save to output/ folder
-            OUTPUT_DIR.mkdir(exist_ok=True)
-            (OUTPUT_DIR / f"{_filename_stem}_anonymise.md").write_text(
-                result["text"], encoding="utf-8",
-            )
-            (OUTPUT_DIR / f"{_filename_stem}_mapping.json").write_text(
-                json.dumps(
-                    result["mapping"], indent=2, ensure_ascii=False,
-                ),
-                encoding="utf-8",
-            )
-            (OUTPUT_DIR / f"{_filename_stem}_rapport.md").write_text(
-                result["report"], encoding="utf-8",
-            )
-            if _images:
-                save_images(
-                    _images, OUTPUT_DIR / f"{_filename_stem}_images",
-                )
+            # Auto-save to output/<document>/
+            ecrire_sorties(OUTPUT_DIR / _filename_stem, _filename_stem,
+                           result, _images)
         except Exception as e:
             _pipe["error"] = str(e)
         finally:
@@ -903,7 +918,8 @@ def afficher_progression():
         st.warning(t("cancelling"))
     # Rappel permanent : même si la page est fermée ou rechargée, le
     # traitement continue et les fichiers sont écrits sur le disque.
-    st.caption(f"{t('files_written_to')} `output/`")
+    st.caption(f"{t('files_written_to')} "
+               f"`output/{st.session_state.filename_stem}/`")
 
 
 if pipe["running"]:
@@ -915,30 +931,54 @@ if pipe["running"]:
 # disque mais invisibles ici. Ce panneau les retrouve, pour ne pas avoir
 # à fouiller l'explorateur.
 
+def _bouton_telechargement(fichier: Path, cle: str):
+    col_nom, col_dl = st.columns([4, 1])
+    taille = fichier.stat().st_size
+    unite = f"{taille / 1024:.0f} Ko" if taille < 1_048_576 \
+        else f"{taille / 1_048_576:.1f} Mo"
+    col_nom.write(f"`{fichier.name}` — {unite}")
+    with col_dl:
+        st.download_button(
+            "⬇️",
+            data=fichier.read_bytes(),
+            file_name=fichier.name,
+            key=f"dl_prev_{cle}",
+            width="stretch",
+        )
+
+
 if not pipe["running"] and OUTPUT_DIR.exists():
-    produits = sorted(
-        (f for f in OUTPUT_DIR.iterdir() if f.is_file()),
+    # Un dossier par document, le plus récent d'abord. Les fichiers
+    # laissés à la racine viennent de l'ancienne organisation à plat.
+    dossiers = sorted(
+        (d for d in visibles(OUTPUT_DIR) if d.is_dir()),
+        key=date_dossier, reverse=True,
+    )
+    anciens = sorted(
+        (f for f in visibles(OUTPUT_DIR) if f.is_file()),
         key=lambda f: f.stat().st_mtime, reverse=True,
     )
-    if produits:
+    if dossiers or anciens:
         with st.expander(f"\U0001f4c1 {t('previous_files_title')}"):
             st.caption(t("previous_files_caption"))
-            for fichier in produits[:12]:
-                col_nom, col_dl = st.columns([4, 1])
-                taille = fichier.stat().st_size
-                unite = f"{taille / 1024:.0f} Ko" if taille < 1_048_576 \
-                    else f"{taille / 1_048_576:.1f} Mo"
+            for dossier in dossiers[:12]:
                 horodatage = time.strftime(
-                    "%d/%m %H:%M", time.localtime(fichier.stat().st_mtime))
-                col_nom.write(f"`{fichier.name}` — {unite} — {horodatage}")
-                with col_dl:
-                    st.download_button(
-                        "⬇️",
-                        data=fichier.read_bytes(),
-                        file_name=fichier.name,
-                        key=f"dl_prev_{fichier.name}",
-                        width="stretch",
-                    )
+                    "%d/%m %H:%M", time.localtime(date_dossier(dossier)))
+                st.markdown(f"**{dossier.name}/** — {horodatage}")
+                for fichier in sorted(f for f in visibles(dossier)
+                                      if f.is_file()):
+                    _bouton_telechargement(
+                        fichier, f"{dossier.name}/{fichier.name}")
+                nb_images = sum(
+                    1 for d in visibles(dossier) if d.is_dir()
+                    for f in visibles(d) if f.is_file())
+                if nb_images:
+                    st.caption(t("previous_images", n=nb_images,
+                                 dossier=f"output/{dossier.name}/"))
+            if anciens:
+                st.markdown(f"**{t('previous_loose_files')}**")
+                for fichier in anciens[:12]:
+                    _bouton_telechargement(fichier, fichier.name)
 
 # ── Pipeline error ───────────────────────────────────────────
 
@@ -959,12 +999,13 @@ if pipe["result"] is not None:
     # Output saved notification
     filename_stem = st.session_state.filename_stem
     saved_files = (
-        f"`output/{filename_stem}_anonymise.md`, "
-        f"`output/{filename_stem}_mapping.json`, "
-        f"`output/{filename_stem}_rapport.md`"
+        f"`output/{filename_stem}/` : "
+        f"`{filename_stem}_anonymise.md`, "
+        f"`{filename_stem}_mapping.json`, "
+        f"`{filename_stem}_rapport.md`"
     )
     if images:
-        saved_files += f", `output/{filename_stem}_images/`"
+        saved_files += f", `{filename_stem}_images/`"
     st.success(f"{t('output_saved')} {saved_files}")
 
     # Metrics

@@ -79,12 +79,18 @@ garde `backend="ollama"` par défaut (les tests simulent `check_ollama`).
 | Éditeur JSON | Expander pour éditer/coller le dictionnaire en bloc — bien plus rapide que la saisie ligne par ligne. Validation stricte : un JSON mal formé est refusé sans écraser le fichier existant |
 | Image extraction | Checkbox pour activer l'extraction d'images docx/pdf |
 | Progress bar | Fragment `afficher_progression()` avec `run_every=1s`. **Ne jamais revenir à une boucle bloquante** : un run de script de plusieurs heures perd la liaison navigateur, l'interface se figeait sur son dernier rendu et les résultats ne s'affichaient jamais |
-| Fichiers déjà produits | Expander listant `output/` avec boutons de téléchargement — filet si la session est perdue pendant un traitement long |
+| Fichiers déjà produits | Expander listant `output/`, un bloc par dossier de document (le plus récent d'abord, date = fichier le plus récent du dossier), boutons de téléchargement — filet si la session est perdue pendant un traitement long. Fichiers cachés (`.DS_Store`) ignorés ; anciens fichiers à plat encore listés |
 | Stop button | Met `cancel_flag.set()`, pipeline s'arrête **entre** les chunks : le bloc déjà parti chez Ollama doit revenir. Le bouton se désactive au clic et un message explique l'attente |
 | Tabs avant/après | Prévisualisation du résultat + rapport |
 | Download buttons | Fichier anonymisé, mapping, rapport, images (zip) |
 
 ### Fichiers de sortie
+
+L'interface écrit dans **`output/<nom>/`**, un dossier par document
+(`ecrire_sorties()`), sinon les sorties de plusieurs documents se
+mélangeaient. Les noms gardent le préfixe `<nom>_`. `output/` est
+redirigeable par `ANONYMISE_OUTPUT_DIR` (utilisé par les tests). Le CLI
+écrit à côté du fichier source.
 
 - `*_anonymise.md` — document nettoyé (partageable)
 - `*_mapping.json` — table tag ↔ valeur originale (confidentiel)
@@ -421,7 +427,7 @@ n'anonymisait rien du tout.
 python -m unittest discover -s tests -t .
 ```
 
-121 tests, sans dépendance externe, sans Ollama ni LM Studio (les appels
+129 tests, sans dépendance externe, sans Ollama ni LM Studio (les appels
 LLM sont simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.
@@ -433,6 +439,7 @@ document sensible par accident.
 | `test_extraction.py` | docx/pdf — correspondance placeholder ↔ fichier vérifiée **par la couleur des pixels** (un simple comptage ne détecte pas un décalage de numérotation) |
 | `test_garde_fous.py` | Rejet d'intégrité, catégories inventées, chunks non traités, annulation, ordre des chunks en parallèle |
 | `test_interface_json.py` | Éditeur JSON de l'UI, exécuté via `AppTest` de Streamlit (saisie → clic → écriture → relecture). `check_llm` y est simulé : sinon l'état du moteur sur la machine faisait échouer les tests |
+| `test_sorties.py` | Un dossier par document dans `output/`, ordre du panneau « Fichiers déjà produits », fichiers cachés ignorés — sur un `output/` temporaire |
 | `test_lmstudio.py` | Backend LM Studio — format de requête, réflexion coupée, réponse tronquée/vide, repli sans `reasoning_effort`, filtrage des embeddings, aiguillage du pipeline |
 
 `run_pipeline(..., verbose=False)` coupe l'affichage console tout en

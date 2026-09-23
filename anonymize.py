@@ -1076,6 +1076,27 @@ def save_images(
     return filenames
 
 
+def ecrire_sorties(dossier: Path, stem: str, result: dict,
+                   images: list[tuple[bytes, str]] | None = None) -> Path:
+    """Écrit les sorties d'un document dans son propre dossier.
+
+    Un dossier par document : écrites à plat dans output/, les sorties
+    de plusieurs documents se mélangeaient. Les noms gardent le préfixe
+    du document, pour rester identifiables une fois copiés ailleurs.
+    """
+    dossier.mkdir(parents=True, exist_ok=True)
+    (dossier / f"{stem}_anonymise.md").write_text(
+        result["text"], encoding="utf-8")
+    (dossier / f"{stem}_mapping.json").write_text(
+        json.dumps(result["mapping"], indent=2, ensure_ascii=False),
+        encoding="utf-8")
+    (dossier / f"{stem}_rapport.md").write_text(
+        result["report"], encoding="utf-8")
+    if images:
+        save_images(images, dossier / f"{stem}_images")
+    return dossier
+
+
 # =============================================================================
 # DÉCOUPAGE
 # =============================================================================
