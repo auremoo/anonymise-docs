@@ -320,6 +320,14 @@ def apply_custom_words(
 
 DICT_PATH = Path(__file__).resolve().parent / "sensitive-words.json"
 
+# Dossier des sorties, commun au CLI et à l'interface : un sous-dossier
+# par document (voir ecrire_sorties). Redirigeable pour les tests, qui ne
+# doivent pas écrire dans le vrai dossier output/ de l'utilisateur.
+OUTPUT_DIR = Path(
+    os.environ.get("ANONYMISE_OUTPUT_DIR")
+    or Path(__file__).resolve().parent / "output"
+)
+
 
 def load_sensitive_words(filepath: Path | None = None) -> dict[str, str]:
     """Charge un dictionnaire de mots sensibles.
@@ -1691,7 +1699,16 @@ Exemples :
         help="Modele LLM (defaut : mistral:latest pour ollama, "
              "qwen/qwen3.5-9b pour lmstudio)",
     )
-    parser.add_argument("--output", "-o", help="Fichier de sortie")
+    parser.add_argument(
+        "--output", "-o",
+        help="Copie supplementaire du document anonymise a cet emplacement "
+             "(le dossier de sortie reste complet)",
+    )
+    parser.add_argument(
+        "--output-dir", metavar="DIR",
+        help="Dossier des sorties, un sous-dossier par document "
+             "(defaut : output/ du projet, comme l'interface)",
+    )
     parser.add_argument(
         "--url", "--ollama-url", dest="url",
         help="URL du moteur (defaut : http://localhost:11434 pour ollama, "
@@ -1740,10 +1757,15 @@ Exemples :
     # Read file + extract images
     text, images = read_file_with_images(filepath)
 
+    # Un dossier par document, comme dans l'interface : écrites à côté du
+    # fichier source, les sorties de plusieurs documents se mélangeaient.
+    stem = filepath.stem
+    dossier = Path(args.output_dir or OUTPUT_DIR) / stem
+
     images_folder_name = ""
     if images:
-        images_dir = filepath.with_name(f"{filepath.stem}_images")
-        saved = save_images(images, images_dir)
+        images_dir = dossier / f"{stem}_images"
+        save_images(images, images_dir)
         images_folder_name = images_dir.name
         print(f"  🖼️  {len(images)} image(s) extraite(s) → {images_dir}")
 
@@ -1767,20 +1789,11 @@ Exemples :
         parallel=args.parallel,
     )
 
-    output_path = (
-        Path(args.output) if args.output
-        else filepath.with_name(f"{filepath.stem}_anonymise.md")
-    )
-    output_path.write_text(result["text"], encoding="utf-8")
-
-    mapping_path = filepath.with_name(f"{filepath.stem}_mapping.json")
-    mapping_path.write_text(
-        json.dumps(result["mapping"], indent=2, ensure_ascii=False),
-        encoding="utf-8",
-    )
-
-    report_path = filepath.with_name(f"{filepath.stem}_rapport.md")
-    report_path.write_text(result["report"], encoding="utf-8")
+    ecrire_sorties(dossier, stem, result)
+    output_path = dossier / f"{stem}_anonymise.md"
+    if args.output:
+        output_path = Path(args.output)
+        output_path.write_text(result["text"], encoding="utf-8")
 
     s = result["stats"]
     print(f"\n{'='*60}")
@@ -1797,6 +1810,7 @@ Exemples :
     if images:
         print(f"  🖼️  Images       : {len(images)} → {images_folder_name}/")
     print(f"  ⏱️  Durée        : {s['duree_totale']}s")
+    print(f"  📁 Dossier      : {dossier}")
     print(f"  ✅ Sortie       : {output_path}")
     print(f"{'='*60}")
     # Le fichier est toujours écrit : si des portions n'ont pas été

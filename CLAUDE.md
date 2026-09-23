@@ -86,11 +86,13 @@ garde `backend="ollama"` par défaut (les tests simulent `check_ollama`).
 
 ### Fichiers de sortie
 
-L'interface écrit dans **`output/<nom>/`**, un dossier par document
-(`ecrire_sorties()`), sinon les sorties de plusieurs documents se
-mélangeaient. Les noms gardent le préfixe `<nom>_`. `output/` est
-redirigeable par `ANONYMISE_OUTPUT_DIR` (utilisé par les tests). Le CLI
-écrit à côté du fichier source.
+CLI et interface écrivent dans **`output/<nom>/`**, un dossier par
+document (`ecrire_sorties()`, `OUTPUT_DIR` dans `anonymize.py`), sinon
+les sorties de plusieurs documents se mélangeaient. Les noms gardent le
+préfixe `<nom>_`. CLI : `--output-dir` change le dossier, `-o` ajoute une
+copie du document anonymisé. `OUTPUT_DIR` est lu à l'import : les tests
+remplacent l'attribut `anonymize.OUTPUT_DIR`, pas la variable
+`ANONYMISE_OUTPUT_DIR`.
 
 - `*_anonymise.md` — document nettoyé (partageable)
 - `*_mapping.json` — table tag ↔ valeur originale (confidentiel)
@@ -427,7 +429,7 @@ n'anonymisait rien du tout.
 python -m unittest discover -s tests -t .
 ```
 
-129 tests, sans dépendance externe, sans Ollama ni LM Studio (les appels
+131 tests, sans dépendance externe, sans Ollama ni LM Studio (les appels
 LLM sont simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.
@@ -439,7 +441,7 @@ document sensible par accident.
 | `test_extraction.py` | docx/pdf — correspondance placeholder ↔ fichier vérifiée **par la couleur des pixels** (un simple comptage ne détecte pas un décalage de numérotation) |
 | `test_garde_fous.py` | Rejet d'intégrité, catégories inventées, chunks non traités, annulation, ordre des chunks en parallèle |
 | `test_interface_json.py` | Éditeur JSON de l'UI, exécuté via `AppTest` de Streamlit (saisie → clic → écriture → relecture). `check_llm` y est simulé : sinon l'état du moteur sur la machine faisait échouer les tests |
-| `test_sorties.py` | Un dossier par document dans `output/`, ordre du panneau « Fichiers déjà produits », fichiers cachés ignorés — sur un `output/` temporaire |
+| `test_sorties.py` | Un dossier par document dans `output/` (CLI et interface), ordre du panneau « Fichiers déjà produits », fichiers cachés ignorés — sur un `output/` temporaire |
 | `test_lmstudio.py` | Backend LM Studio — format de requête, réflexion coupée, réponse tronquée/vide, repli sans `reasoning_effort`, filtrage des embeddings, aiguillage du pipeline |
 
 `run_pipeline(..., verbose=False)` coupe l'affichage console tout en

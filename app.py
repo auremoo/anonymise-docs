@@ -5,7 +5,6 @@ Lancement : streamlit run app.py
 """
 
 import io
-import os
 import json
 import time
 import zipfile
@@ -19,6 +18,7 @@ from anonymize import (
     read_file_bytes,
     run_pipeline,
     ecrire_sorties,
+    OUTPUT_DIR,
     check_llm,
     BACKENDS,
     DEFAULT_BACKEND,
@@ -380,12 +380,6 @@ AIDE_MOTEUR = {
     "lmstudio": {"demarrage": "lms server start",
                  "installation": "`lms get qwen/qwen3.5-9b`"},
 }
-# Redirigeable pour les tests, qui ne doivent pas écrire dans le vrai
-# dossier output/ de l'utilisateur.
-OUTPUT_DIR = Path(
-    os.environ.get("ANONYMISE_OUTPUT_DIR")
-    or Path(__file__).resolve().parent / "output"
-)
 
 
 def date_dossier(dossier: Path) -> float:

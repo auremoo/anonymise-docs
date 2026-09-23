@@ -49,9 +49,9 @@ You want to use Claude, ChatGPT, or any cloud AI to analyze your documents — b
 | `<name>_rapport.md` | Detailed anonymization report with stats | Optional — useful for audit |
 | `<name>_images/` | Extracted images (IMAGE_1.png, IMAGE_2.jpg...) | **Review first** — check for sensitive content |
 
-The web interface writes each document into its own folder,
-`output/<name>/`, so outputs of several documents never mix. The CLI
-writes next to the source file.
+Each document gets its own folder, `output/<name>/` in the project, so
+outputs of several documents never mix. The CLI and the web interface
+use the same folder (`--output-dir` to change it for the CLI).
 
 ### Image extraction
 
@@ -195,7 +195,8 @@ python anonymize.py big_file.docx --chunk-size 2000
 |--------|---------|-------------|
 | `--backend` | `lmstudio` on macOS, `ollama` elsewhere | Local LLM engine |
 | `--model` | `mistral:latest` (ollama), `qwen/qwen3.5-9b` (lmstudio) | Model to use |
-| `--output`, `-o` | `<name>_anonymise.md` | Output file path |
+| `--output-dir` | `output/` | Output folder; each document gets its own sub-folder `<name>/` |
+| `--output`, `-o` | — | Extra copy of the anonymized document at this path (the output folder stays complete) |
 | `--url` (alias `--ollama-url`) | `http://localhost:11434` (ollama), `http://localhost:1234` (lmstudio) | Engine API URL |
 | `--no-llm` | `false` | Regex-only mode (no LLM) |
 | `--chunk-size` | `1500` | Max characters per LLM chunk. Smaller = fewer missed entities at the end of a chunk, and faster (attention cost is quadratic) |
@@ -513,9 +514,10 @@ identifie un client aussi sûrement qu'un nom.
 | `*_rapport.md` | Rapport détaillé de l'anonymisation | Optionnel |
 | `*_images/` | Images extraites (IMAGE_1.png, IMAGE_2.jpg...) | **À vérifier** — contrôlez le contenu sensible |
 
-L'interface web range chaque document dans son propre dossier,
-`output/<nom>/` : les sorties de plusieurs documents ne se mélangent
-plus. Le CLI écrit à côté du fichier source.
+Chaque document a son propre dossier, `output/<nom>/` dans le projet :
+les sorties de plusieurs documents ne se mélangent plus. Le CLI et
+l'interface utilisent le même dossier (`--output-dir` pour le changer en
+CLI).
 
 ## Workflow typique
 
@@ -532,7 +534,7 @@ plus. Le CLI écrit à côté du fichier source.
 python -m unittest discover -s tests -t .
 ```
 
-129 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama ni de LM Studio (les
+131 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama ni de LM Studio (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 

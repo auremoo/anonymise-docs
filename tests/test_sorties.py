@@ -1,8 +1,8 @@
 """Rangement des sorties : un dossier par document dans output/.
 
 Écrites à plat, les sorties de plusieurs documents se mélangeaient dans
-output/. Les tests d'interface redirigent output/ vers un temporaire via
-ANONYMISE_OUTPUT_DIR : ils ne doivent jamais toucher au vrai dossier.
+output/, ou à côté du fichier source pour le CLI. Les tests redirigent
+output/ vers un temporaire : ils ne doivent jamais toucher au vrai dossier.
 """
 
 import os
@@ -59,6 +59,42 @@ class TestEcritureSorties(unittest.TestCase):
         self.assertEqual(
             (self.output / "cdc" / "cdc_anonymise.md").read_text(), "v2")
 
+    def test_cli_ecrit_dans_un_dossier_par_document(self):
+        """Le CLI écrivait à côté du fichier source : plusieurs documents
+        d'un même dossier y mélangeaient leurs sorties."""
+        sources = Path(tempfile.mkdtemp(dir=self._tmp.name))
+        for nom in ("cdc.md", "spec.md"):
+            (sources / nom).write_text("Contact : admin@acme.fr\n")
+            argv = ["anonymize.py", str(sources / nom), "--no-llm",
+                    "--dict", str(sources / "vide.json"),
+                    "--output-dir", str(self.output)]
+            with mock.patch("sys.argv", argv), \
+                 mock.patch("builtins.print"):
+                anonymize.main()
+        self.assertEqual(
+            sorted(p.name for p in sources.iterdir()),
+            ["cdc.md", "spec.md"])  # rien d'écrit à côté des sources
+        for stem in ("cdc", "spec"):
+            self.assertEqual(
+                sorted(p.name for p in (self.output / stem).iterdir()),
+                [f"{stem}_anonymise.md", f"{stem}_mapping.json",
+                 f"{stem}_rapport.md"])
+        self.assertIn("[EMAIL_1]",
+                      (self.output / "cdc" / "cdc_anonymise.md").read_text())
+
+    def test_cli_option_o_ajoute_une_copie(self):
+        source = Path(self._tmp.name) / "cdc.md"
+        source.write_text("Contact : admin@acme.fr\n")
+        copie = Path(self._tmp.name) / "copie.md"
+        argv = ["anonymize.py", str(source), "--no-llm", "-o", str(copie),
+                "--dict", str(Path(self._tmp.name) / "vide.json"),
+                "--output-dir", str(self.output / "sorties")]
+        with mock.patch("sys.argv", argv), mock.patch("builtins.print"):
+            anonymize.main()
+        self.assertIn("[EMAIL_1]", copie.read_text())
+        self.assertTrue(
+            (self.output / "sorties" / "cdc" / "cdc_anonymise.md").is_file())
+
     def test_mapping_lisible(self):
         ecrire_sorties(self.output / "cdc", "cdc", _resultat("A"))
         self.assertIn("Jean Dupont",
@@ -72,10 +108,11 @@ class TestPanneauFichiersProduits(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.output = Path(self._tmp.name)
-        env = mock.patch.dict(os.environ,
-                              {"ANONYMISE_OUTPUT_DIR": str(self.output)})
-        env.start()
-        self.addCleanup(env.stop)
+        # OUTPUT_DIR est lu à l'import d'anonymize : c'est l'attribut qu'il
+        # faut remplacer, l'app le réimporte à chaque exécution.
+        sortie = mock.patch.object(anonymize, "OUTPUT_DIR", self.output)
+        sortie.start()
+        self.addCleanup(sortie.stop)
         llm = mock.patch.object(anonymize, "check_llm",
                                 return_value=(True, "ok", ["modele"]))
         llm.start()
