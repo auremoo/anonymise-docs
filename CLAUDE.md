@@ -94,6 +94,10 @@ copie du document anonymisé. `OUTPUT_DIR` est lu à l'import : les tests
 remplacent l'attribut `anonymize.OUTPUT_DIR`, pas la variable
 `ANONYMISE_OUTPUT_DIR`.
 
+Les sorties antérieures à ce changement, écrites à plat dans `output/`, ont
+été rangées dans cette structure le 24/09/2026 (4 documents, 881 fichiers,
+vérifié par comparaison du nombre de fichiers et du volume avant/après).
+
 - `*_anonymise.md` — document nettoyé (partageable)
 - `*_mapping.json` — table tag ↔ valeur originale (confidentiel)
 - `*_rapport.md` — rapport détaillé d'exécution
@@ -481,7 +485,7 @@ python anonymize.py document.docx --dict mes_mots.json
 # CLI — 3 passes LLM (max qualité)
 python anonymize.py document.docx --passes 3
 
-# CLI — nombre de chunks envoyés en parallèle à Ollama (défaut 3)
+# CLI — nombre de chunks envoyés en parallèle au LLM (défaut 1 : mesuré sans gain)
 python anonymize.py document.docx --parallel 1
 
 # Vérifier qu'Ollama tourne
