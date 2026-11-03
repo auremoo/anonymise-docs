@@ -16,6 +16,7 @@ import re
 import sys
 import json
 import time
+import codecs
 import hashlib
 import argparse
 import datetime
@@ -54,6 +55,20 @@ except ImportError:
 # =============================================================================
 # LOGGER — Tout est tracé
 # =============================================================================
+
+def _afficher(ligne: str):
+    """print() qui ne plante pas sur une console non UTF-8.
+
+    Sous Windows, une sortie redirigée (`> journal.txt`, pipe) est encodée
+    en cp1252 : le premier emoji levait UnicodeEncodeError et arrêtait le
+    traitement. Les caractères non représentables deviennent « ? ».
+    """
+    try:
+        print(ligne)
+    except UnicodeEncodeError:
+        encodage = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(ligne.encode(encodage, errors="replace").decode(encodage))
+
 
 class Logger:
     """Collecte tous les événements pour le rapport final."""
@@ -101,7 +116,7 @@ class Logger:
                  "DONE": "✅", "STOP": "🛑", "IMG": "🖼️"}
         icon = icons.get(level, "•")
         if self.verbose:
-            print(f"  {icon} [{timestamp:6.1f}s] {message}")
+            _afficher(f"  {icon} [{timestamp:6.1f}s] {message}")
         if self.on_progress and progress is not None:
             self.on_progress(f"{message} — {self.elapsed()}", progress)
 
@@ -1001,35 +1016,53 @@ def normaliser_texte(texte: str) -> str:
     return _COUPURE_REFERENCE.sub("-", texte)
 
 
+FORMATS_TEXTE = (".md", ".txt", ".csv", ".log", ".conf", ".ini",
+                 ".yaml", ".yml", ".json", ".xml")
+
+
+def decoder_texte(data: bytes, strict: bool = False) -> str:
+    """Décode un fichier texte, quel que soit l'encodage usuel sous Windows.
+
+    - UTF-8, avec ou sans BOM (le BOM restait sinon en tête du texte) ;
+    - UTF-16 avec BOM (sortie redirigée de PowerShell 5, « Unicode » du
+      Bloc-notes) ;
+    - Windows-1252 en dernier recours : un CSV exporté par Excel l'est
+      souvent, et la lecture stricte en UTF-8 le refusait purement et
+      simplement.
+
+    `strict=True` (extension inconnue) n'applique pas ce dernier repli, qui
+    accepte n'importe quels octets : un fichier binaire serait « lu »
+    comme du texte illisible au lieu d'être refusé.
+    """
+    if data.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return data.decode("utf-16")
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        if strict:
+            raise
+        return data.decode("cp1252", errors="replace")
+
+
+def _lire_ou_quitter(lecture: Callable, filepath: Path):
+    """CLI : une erreur de lecture devient un message lisible, pas une trace."""
+    try:
+        return lecture(filepath.read_bytes(), filepath.name)
+    except ImportError as e:
+        print(f"❌ {e}", file=sys.stderr)
+    except UnicodeDecodeError:
+        print(f"❌ Format non supporté : {filepath.suffix.lower()}",
+              file=sys.stderr)
+    except Exception as e:
+        # Document corrompu, PDF chiffré, docx enregistré en .doc...
+        print(f"❌ Lecture impossible de {filepath.name} : {e}",
+              file=sys.stderr)
+    sys.exit(1)
+
+
 def read_file(filepath: Path) -> str:
     """Read file as plain text (no image extraction)."""
-    suffix = filepath.suffix.lower()
-    if suffix in (".md", ".txt", ".csv", ".log", ".conf", ".ini",
-                   ".yaml", ".yml", ".json", ".xml"):
-        return filepath.read_text(encoding="utf-8")
-    elif suffix == ".docx":
-        if not HAS_DOCX:
-            print("❌ pip install python-docx", file=sys.stderr)
-            sys.exit(1)
-        doc = Document(str(filepath))
-        # Même parcours ordonné que la lecture avec images : une table de
-        # relations vide fait qu'aucun placeholder n'est émis, tout en
-        # gardant les tableaux à leur place dans le document.
-        return "\n".join(_docx_walk(doc.element.body, {}, []))
-    elif suffix == ".pdf":
-        if not HAS_PDF:
-            print("❌ pip install pymupdf", file=sys.stderr)
-            sys.exit(1)
-        doc = fitz.open(str(filepath))
-        text = "\n".join(page.get_text() for page in doc)
-        doc.close()
-        return text
-    else:
-        try:
-            return filepath.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            print(f"❌ Format non supporté : {suffix}", file=sys.stderr)
-            sys.exit(1)
+    return _lire_ou_quitter(read_file_bytes, filepath)
 
 
 def read_file_with_images(
@@ -1039,33 +1072,22 @@ def read_file_with_images(
     Returns (text_with_IMAGE_placeholders, [(image_bytes, extension), ...]).
     For text-only formats, images list is empty.
     """
-    suffix = filepath.suffix.lower()
-    if suffix == ".docx":
-        if not HAS_DOCX:
-            print("❌ pip install python-docx", file=sys.stderr)
-            sys.exit(1)
-        return _read_docx_with_images(filepath.read_bytes())
-    elif suffix == ".pdf":
-        if not HAS_PDF:
-            print("❌ pip install pymupdf", file=sys.stderr)
-            sys.exit(1)
-        return _read_pdf_with_images(filepath.read_bytes())
-    else:
-        return read_file(filepath), []
+    return _lire_ou_quitter(read_file_bytes_with_images, filepath)
 
 
 def read_file_bytes(data: bytes, filename: str) -> str:
     """Read file from bytes in memory (text only, no image extraction)."""
     suffix = Path(filename).suffix.lower()
-    if suffix in (".md", ".txt", ".csv", ".log", ".conf", ".ini",
-                   ".yaml", ".yml", ".json", ".xml"):
-        return data.decode("utf-8")
+    if suffix in FORMATS_TEXTE:
+        return decoder_texte(data)
     elif suffix == ".docx":
         if not HAS_DOCX:
             raise ImportError("python-docx requis : pip install python-docx")
         doc = Document(io.BytesIO(data))
-        # Idem : parcours ordonné, sans placeholders d'images.
-        return "\n".join(_docx_walk(doc.element.body, {}, []))
+        # Même parcours ordonné que la lecture avec images : une table de
+        # relations vide fait qu'aucun placeholder n'est émis, tout en
+        # gardant les tableaux à leur place dans le document.
+        return "\n".join(_docx_walk(doc.element.body, {}, _Images()))
     elif suffix == ".pdf":
         if not HAS_PDF:
             raise ImportError("pymupdf requis : pip install pymupdf")
@@ -1074,7 +1096,7 @@ def read_file_bytes(data: bytes, filename: str) -> str:
         doc.close()
         return text
     else:
-        return data.decode("utf-8")
+        return decoder_texte(data, strict=True)
 
 
 def read_file_bytes_with_images(
@@ -1708,6 +1730,13 @@ def run_pipeline(
 # =============================================================================
 
 def main():
+    # Sortie redirigée sous Windows (`> journal.txt`) : encodage cp1252, et
+    # le premier emoji levait UnicodeEncodeError avant même la lecture du
+    # document. Les caractères non représentables deviennent « ? ».
+    for flux in (sys.stdout, sys.stderr):
+        if hasattr(flux, "reconfigure"):
+            flux.reconfigure(errors="replace")
+
     parser = argparse.ArgumentParser(
         description="Anonymisation hybride (Regex + LLM local, multi-passe)",
         epilog="""

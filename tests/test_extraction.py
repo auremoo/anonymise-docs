@@ -6,9 +6,11 @@ pas par le nombre d'images — un simple comptage ne détecte pas un
 décalage de numérotation.
 """
 
+import io
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from tests import outils
 from tests.outils import (
@@ -17,7 +19,7 @@ from tests.outils import (
 )
 from anonymize import (
     read_file, read_file_bytes, read_file_with_images,
-    read_file_bytes_with_images, save_images,
+    read_file_bytes_with_images, save_images, Logger,
 )
 
 if A_DOCX:
@@ -178,6 +180,60 @@ class TestFormatsTexte(unittest.TestCase):
             texte, images = read_file_with_images(f)
             self.assertEqual(images, [])
             self.assertIn("a@b.com", texte)
+
+
+class TestEncodages(unittest.TestCase):
+    """Les fichiers texte produits sous Windows ne sont pas tous en UTF-8 :
+    un CSV exporté par Excel était refusé (UnicodeDecodeError)."""
+
+    def test_csv_excel_windows_1252(self):
+        texte = "Société;Ville\nNexans;Orléans\n"
+        self.assertEqual(
+            read_file_bytes(texte.encode("cp1252"), "export.csv"), texte)
+
+    def test_bom_utf8_retire(self):
+        self.assertEqual(
+            read_file_bytes("﻿Contact a@b.com".encode("utf-8"),
+                            "notes.txt"),
+            "Contact a@b.com")
+
+    def test_utf16_de_powershell(self):
+        texte = "Contact a@b.com\r\n"
+        self.assertEqual(
+            read_file_bytes(texte.encode("utf-16"), "journal.log"), texte)
+
+    def test_utf8_inchange(self):
+        texte = "Réunion à Orléans — 12 €"
+        self.assertEqual(read_file_bytes(texte.encode("utf-8"), "a.md"),
+                         texte)
+
+    def test_extension_inconnue_binaire_refusee(self):
+        """Le repli Windows-1252 accepte n'importe quels octets : il ne
+        s'applique qu'aux formats texte connus."""
+        with self.assertRaises(UnicodeDecodeError):
+            read_file_bytes(b"\x89PNG\r\n\x1a\n\xff\x00", "image.bin")
+
+    def test_cli_refuse_proprement(self):
+        with tempfile.TemporaryDirectory() as d:
+            f = Path(d) / "image.bin"
+            f.write_bytes(b"\x89PNG\r\n\x1a\n\xff\x00")
+            with mock.patch("builtins.print") as affiche, \
+                    self.assertRaises(SystemExit):
+                read_file(f)
+        self.assertIn("Format non supporté", affiche.call_args.args[0])
+
+
+class TestConsoleNonUtf8(unittest.TestCase):
+    """Sortie redirigée sous Windows (`> journal.txt`) : cp1252, et le
+    premier emoji arrêtait le traitement."""
+
+    def test_emoji_sur_console_cp1252(self):
+        flux = io.TextIOWrapper(io.BytesIO(), encoding="cp1252")
+        with mock.patch("sys.stdout", flux):
+            Logger().log("INFO", "Début du traitement")
+        flux.flush()
+        self.assertIn("Début du traitement",
+                      flux.buffer.getvalue().decode("cp1252"))
 
 
 class TestSauvegardeImages(unittest.TestCase):
