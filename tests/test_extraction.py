@@ -10,13 +10,19 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from tests import outils
 from tests.outils import (
     RACINE, A_PDF, A_DOCX, creer_pdf, creer_docx, couleur_du_fichier,
+    png_uni,
 )
 from anonymize import (
     read_file, read_file_bytes, read_file_with_images,
     read_file_bytes_with_images, save_images,
 )
+
+if A_DOCX:
+    from docx import Document
+    from docx.shared import Inches
 
 
 @unittest.skipUnless(A_PDF, "pymupdf non installé")
@@ -83,7 +89,7 @@ class TestDocx(unittest.TestCase):
         sortie = self.dossier / "images"
         save_images(images, sortie)
         attendu = {
-            "IMAGE_1": "rouge",  # logo d'en-tête
+            "IMAGE_1": "jaune",  # logo d'en-tête
             "IMAGE_2": "rouge",  # paragraphe
             "IMAGE_3": "vert",   # cellule de tableau
             "IMAGE_4": "bleu",   # paragraphe
@@ -117,6 +123,50 @@ class TestDocx(unittest.TestCase):
             read_file(self.docx),
             read_file_bytes(self.docx.read_bytes(), "test.docx"),
         )
+
+
+@unittest.skipUnless(A_DOCX and A_PDF, "python-docx ou pymupdf non installé")
+class TestImagesRepetees(unittest.TestCase):
+    """Une image répétée garde son numéro : un logo présent sur chacune des
+    197 pages d'un PDF donnait 197 fichiers identiques à vérifier."""
+
+    def test_logo_sur_chaque_page_du_pdf(self):
+        doc = outils.fitz.open()
+        logo = png_uni("rouge")
+        for _ in range(3):
+            page = doc.new_page()
+            page.insert_text((50, 60), "Texte de la page.")
+            page.insert_image(outils.fitz.Rect(50, 100, 110, 160), stream=logo)
+        page.insert_image(outils.fitz.Rect(150, 100, 210, 160),
+                          stream=png_uni("bleu"))
+        donnees = doc.tobytes()
+        doc.close()
+
+        texte, images = read_file_bytes_with_images(donnees, "logo.pdf")
+        self.assertEqual(len(images), 2)
+        self.assertEqual(texte.count("[IMAGE_1]"), 3)
+        self.assertEqual(texte.count("[IMAGE_2]"), 1)
+        with tempfile.TemporaryDirectory() as d:
+            save_images(images, Path(d))
+            self.assertEqual(couleur_du_fichier(Path(d) / "IMAGE_1.png"),
+                             "rouge")
+            self.assertEqual(couleur_du_fichier(Path(d) / "IMAGE_2.png"),
+                             "bleu")
+
+    def test_meme_image_a_deux_endroits_du_docx(self):
+        with tempfile.TemporaryDirectory() as d:
+            source = Path(d) / "rouge.png"
+            source.write_bytes(png_uni("rouge"))
+            doc = Document()
+            doc.add_picture(str(source), width=Inches(1))
+            table = doc.add_table(rows=1, cols=1)
+            table.cell(0, 0).paragraphs[0].add_run().add_picture(
+                str(source), width=Inches(1))
+            chemin = Path(d) / "double.docx"
+            doc.save(str(chemin))
+            texte, images = read_file_with_images(chemin)
+        self.assertEqual(len(images), 1)
+        self.assertEqual(texte.count("[IMAGE_1]"), 2)
 
 
 class TestFormatsTexte(unittest.TestCase):

@@ -16,6 +16,7 @@ import re
 import sys
 import json
 import time
+import hashlib
 import argparse
 import datetime
 import threading
@@ -828,13 +829,32 @@ def _extract_docx_image_rels(part) -> dict[str, tuple[bytes, str]]:
     return image_rels
 
 
-def _docx_para_text(para_element, image_rels, images: list) -> str:
-    """Texte d'un paragraphe, images remplacées par leur placeholder.
+class _Images:
+    """Images extraites, numérotées dans l'ordre de première apparition.
 
-    `images` est complété au fil du parcours : l'index d'une image dans
-    cette liste détermine son numéro de placeholder ET son nom de fichier
-    (IMAGE_N.ext), donc les deux restent alignés par construction.
+    Le numéro d'une image est sa position dans `liste` : il sert au
+    placeholder [IMAGE_N] ET au nom de fichier IMAGE_N.ext, donc les deux
+    restent alignés par construction.
+
+    Une image répétée (logo d'en-tête sur chaque page d'un PDF, même
+    pictogramme dans plusieurs cellules) garde le même numéro : avant, un
+    logo sur 197 pages donnait 197 fichiers identiques à vérifier un par un.
     """
+
+    def __init__(self):
+        self.liste: list[tuple[bytes, str]] = []
+        self._numeros: dict[bytes, int] = {}
+
+    def numero(self, contenu: bytes, ext: str) -> int:
+        empreinte = hashlib.sha256(contenu).digest()
+        if empreinte not in self._numeros:
+            self.liste.append((contenu, ext))
+            self._numeros[empreinte] = len(self.liste)
+        return self._numeros[empreinte]
+
+
+def _docx_para_text(para_element, image_rels, images: _Images) -> str:
+    """Texte d'un paragraphe, images remplacées par leur placeholder."""
     morceaux: list[str] = []
     for child in para_element:
         if child.tag != f"{{{_W_NS}}}r":
@@ -843,8 +863,8 @@ def _docx_para_text(para_element, image_rels, images: list) -> str:
         for blip in child.iter(f"{{{_A_NS}}}blip"):
             embed = blip.get(f"{{{_R_NS}}}embed")
             if embed and embed in image_rels:
-                images.append(image_rels[embed])
-                morceaux.append(f" [IMAGE_{len(images)}] ")
+                n = images.numero(*image_rels[embed])
+                morceaux.append(f" [IMAGE_{n}] ")
                 a_une_image = True
         if not a_une_image:
             for t_elem in child.iter(f"{{{_W_NS}}}t"):
@@ -853,7 +873,7 @@ def _docx_para_text(para_element, image_rels, images: list) -> str:
     return "".join(morceaux)
 
 
-def _docx_walk(parent_element, image_rels, images: list) -> list[str]:
+def _docx_walk(parent_element, image_rels, images: _Images) -> list[str]:
     """Parcourt paragraphes ET tableaux dans l'ordre du document.
 
     L'ancienne version listait `doc.paragraphs` puis `doc.tables`, ce qui
@@ -880,7 +900,7 @@ def _docx_walk(parent_element, image_rels, images: list) -> list[str]:
 def _read_docx_with_images(data: bytes) -> tuple[str, list[tuple[bytes, str]]]:
     """Read docx → (text with [IMAGE_N] placeholders, [(bytes, ext), ...])."""
     doc = Document(io.BytesIO(data))
-    images: list[tuple[bytes, str]] = []
+    images = _Images()
 
     # En-têtes et pieds de page : c'est là que se trouvent les logos, qui
     # identifient le client aussi sûrement qu'un nom. On les extrait pour
@@ -902,39 +922,42 @@ def _read_docx_with_images(data: bytes) -> tuple[str, list[tuple[bytes, str]]]:
     image_rels = _extract_docx_image_rels(doc.part)
     corps = _docx_walk(doc.element.body, image_rels, images)
     parts = entetes + corps
-    return "\n".join(parts), images
+    return "\n".join(parts), images.liste
 
 
 def _read_pdf_with_images(data: bytes) -> tuple[str, list[tuple[bytes, str]]]:
     """Read PDF → (text with [IMAGE_N] placeholders, [(bytes, ext), ...])."""
     doc = fitz.open(stream=data, filetype="pdf")
-    images: list[tuple[bytes, str]] = []
-    img_counter = 0
+    images = _Images()
+    # xref → numéro : une image partagée par toutes les pages n'est décodée
+    # qu'une fois, au lieu d'une fois par page.
+    par_xref: dict[int, int | None] = {}
     parts: list[str] = []
 
     for page in doc:
         page_text = page.get_text()
-        # Extract images from this page
-        page_images = page.get_images(full=True)
-        if page_images:
-            img_refs: list[str] = []
-            for img_info in page_images:
-                xref = img_info[0]
+        img_refs: list[str] = []
+        for img_info in page.get_images(full=True):
+            xref = img_info[0]
+            if xref not in par_xref:
                 try:
                     base_image = doc.extract_image(xref)
                 except Exception:
-                    continue
+                    base_image = None
                 if base_image and base_image.get("image"):
-                    img_counter += 1
-                    ext = base_image.get("ext", "png")
-                    images.append((base_image["image"], ext))
-                    img_refs.append(f"[IMAGE_{img_counter}]")
-            if img_refs:
-                page_text += "\n" + "\n".join(img_refs) + "\n"
+                    par_xref[xref] = images.numero(
+                        base_image["image"], base_image.get("ext", "png"))
+                else:
+                    par_xref[xref] = None
+            n = par_xref[xref]
+            if n is not None and f"[IMAGE_{n}]" not in img_refs:
+                img_refs.append(f"[IMAGE_{n}]")
+        if img_refs:
+            page_text += "\n" + "\n".join(img_refs) + "\n"
         parts.append(page_text)
 
     doc.close()
-    return "\n".join(parts), images
+    return "\n".join(parts), images.liste
 
 
 # Caractères typographiques que docx et pdf produisent à la place de leurs

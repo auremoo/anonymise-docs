@@ -38,6 +38,7 @@ COULEURS = {
     "rouge": (255, 0, 0),
     "vert": (0, 255, 0),
     "bleu": (0, 0, 255),
+    "jaune": (255, 255, 0),
 }
 
 
@@ -54,6 +55,8 @@ def couleur_du_fichier(chemin: Path) -> str:
     x = min(20, pix.width - 1)
     y = min(20, pix.height - 1)
     r, g, b = pix.pixel(x, y)[:3]
+    if r > 200 and g > 200 and b < 60:
+        return "jaune"
     if r > 200 and g < 60 and b < 60:
         return "rouge"
     if g > 200 and r < 60 and b < 60:
@@ -85,15 +88,16 @@ def creer_pdf(destination: Path) -> Path:
 def creer_docx(destination: Path, dossier_images: Path) -> Path:
     """docx couvrant les emplacements d'images qui ont posé problème.
 
-    Ordre attendu des placeholders :
-      IMAGE_1 = logo d'en-tête (rouge)
+    Ordre attendu des placeholders (quatre images distinctes : une image
+    répétée garde le même numéro, voir `_Images`) :
+      IMAGE_1 = logo d'en-tête (jaune)
       IMAGE_2 = paragraphe (rouge)
       IMAGE_3 = cellule de tableau (vert)
       IMAGE_4 = paragraphe (bleu)
     """
     dossier_images.mkdir(parents=True, exist_ok=True)
     fichiers = {}
-    for nom in ("rouge", "vert", "bleu"):
+    for nom in ("rouge", "vert", "bleu", "jaune"):
         f = dossier_images / f"src_{nom}.png"
         f.write_bytes(png_uni(nom))
         fichiers[nom] = str(f)
@@ -120,7 +124,7 @@ def creer_docx(destination: Path, dossier_images: Path) -> Path:
     # du docx que le corps.
     entete = doc.sections[0].header
     entete.paragraphs[0].add_run().add_picture(
-        fichiers["rouge"], width=Inches(0.5)
+        fichiers["jaune"], width=Inches(0.5)
     )
 
     doc.save(str(destination))
