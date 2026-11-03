@@ -36,11 +36,18 @@ try:
 except ImportError:
     HAS_DOCX = False
 
+# PyMuPDF 2.x annonce la suppression du nom historique « fitz » : on
+# importe « pymupdf » (disponible depuis la 1.24.3), et « fitz » seulement
+# pour les versions plus anciennes.
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz
     HAS_PDF = True
 except ImportError:
-    HAS_PDF = False
+    try:
+        import fitz
+        HAS_PDF = True
+    except ImportError:
+        HAS_PDF = False
 
 
 # =============================================================================

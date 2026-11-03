@@ -1,5 +1,8 @@
 requests
 python-docx
-pymupdf
+# PyMuPDF 2 tire onnxruntime, networkx et des modèles de mise en page
+# (~120 Mo mesurés) dont le projet ne se sert pas. Le code fonctionne avec
+# les deux versions.
+pymupdf<2
 streamlit
 pandas

@@ -15,10 +15,14 @@ if str(RACINE) not in sys.path:
     sys.path.insert(0, str(RACINE))
 
 try:
-    import fitz  # PyMuPDF
+    import pymupdf as fitz  # « import fitz » est déprécié depuis PyMuPDF 2
     A_PDF = True
 except ImportError:
-    A_PDF = False
+    try:
+        import fitz
+        A_PDF = True
+    except ImportError:
+        A_PDF = False
 
 try:
     from docx import Document
