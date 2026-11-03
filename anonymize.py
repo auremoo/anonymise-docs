@@ -17,6 +17,7 @@ import sys
 import json
 import time
 import codecs
+import difflib
 import hashlib
 import argparse
 import datetime
@@ -105,6 +106,12 @@ class Logger:
         with self._lock:
             self.stats[key] = self.stats.get(key, 0) + n
 
+    def noter(self, key: str, exemples: list[str], limite: int = 5):
+        """Garde quelques exemples pour les avertissements (thread-safe)."""
+        with self._lock:
+            liste = self.stats.setdefault(key, [])
+            liste.extend(exemples[:max(limite - len(liste), 0)])
+
     def log(self, level: str, message: str, progress: float | None = None):
         timestamp = time.time() - self.start_time
         entry = {"t": round(timestamp, 2), "level": level, "msg": message}
@@ -122,7 +129,12 @@ class Logger:
 
     def generate_report(self, regex_anon, llm_entity_map,
                         images_folder: str = "") -> str:
-        """Génère le rapport Markdown complet."""
+        """Génère le rapport Markdown complet.
+
+        `llm_entity_map` : {tag posé par le LLM: occurrences}. Ces tags sont
+        listés avec leur valeur d'origine dans la section LLM, et exclus de
+        la table de la passe 1.
+        """
         self.stats["duree_totale"] = round(time.time() - self.start_time, 2)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -172,14 +184,18 @@ class Logger:
         lines.append(f"**{self.stats['regex_remplacements']} remplacement(s)**")
         lines.append("")
 
-        if regex_anon.mapping:
+        # Un tag peut avoir plusieurs clés (variantes d'une même entité) :
+        # une ligne par tag.
+        lignes_regex = {}
+        for key, tag in regex_anon.mapping.items():
+            if tag not in llm_entity_map and tag not in lignes_regex:
+                cat, normalise = key.split("::", 1)
+                lignes_regex[tag] = (cat, regex_anon.originals.get(
+                    tag, normalise))
+        if lignes_regex:
             lines.append("| Tag | Catégorie | Valeur originale |")
             lines.append("|-----|-----------|-----------------|")
-            for key, tag in sorted(
-                regex_anon.mapping.items(), key=lambda x: x[1]
-            ):
-                cat, normalise = key.split("::", 1)
-                original = regex_anon.originals.get(tag, normalise)
+            for tag, (cat, original) in sorted(lignes_regex.items()):
                 lines.append(f"| `{tag}` | {cat} | `{original}` |")
             lines.append("")
 
@@ -191,15 +207,32 @@ class Logger:
             f"**Chunks traités :** {self.stats['llm_chunks_traites']}  "
         )
         lines.append(f"**Erreurs LLM :** {self.stats['llm_erreurs']}  ")
+        corrections = [
+            ("llm_entites", "Entités remplacées par le LLM"),
+            ("llm_ajouts_retires", "Ajouts du LLM retirés (préambule, "
+                                   "commentaire)"),
+            ("llm_tags_restaures", "Tags existants modifiés par le LLM, "
+                                   "rétablis"),
+            ("llm_passages_retablis", "Passages supprimés ou réécrits, "
+                                      "rétablis sans anonymisation LLM"),
+            ("llm_modifications", "Retouches hors entités conservées"),
+        ]
+        for cle, libelle in corrections:
+            if self.stats.get(cle):
+                lines.append(f"**{libelle} :** {self.stats[cle]}  ")
         lines.append("")
 
         if llm_entity_map:
-            lines.append("**Entités détectées par le LLM :**")
+            lines.append(
+                "**Entités détectées par le LLM** — à relire : un terme "
+                "technique tagué à tort (« TGBT » en `[ENTREPRISE_N]`) "
+                "n'est détectable qu'ici.")
             lines.append("")
-            lines.append("| Tag | Occurrences |")
-            lines.append("|-----|------------|")
+            lines.append("| Tag | Valeur originale | Occurrences |")
+            lines.append("|-----|-----------------|------------|")
             for tag, count in sorted(llm_entity_map.items()):
-                lines.append(f"| `{tag}` | {count} |")
+                original = regex_anon.originals.get(tag, VALEUR_LLM_INCONNUE)
+                lines.append(f"| `{tag}` | `{original}` | {count} |")
             lines.append("")
 
         # Vérification
@@ -407,7 +440,19 @@ def _looks_like_ipv6(candidate: str) -> bool:
     )
 
 
+# Valeur d'un tag posé par le LLM quand le texte qu'il remplace n'a pas pu
+# être retrouvé (plusieurs tags pour un même passage).
+VALEUR_LLM_INCONNUE = "⟨détecté par LLM⟩"
+
+
 class RegexAnonymizer:
+    """Passe 1, et registre commun des tags du document.
+
+    Le dictionnaire (passe 0) et la réconciliation des réponses du LLM
+    numérotent eux aussi leurs tags ici : un seul compteur par catégorie
+    pour tout le document, donc aucune collision entre passes ni entre
+    blocs.
+    """
 
     def __init__(self):
         self.counters = defaultdict(int)
@@ -425,6 +470,14 @@ class RegexAnonymizer:
             self.mapping[key] = f"[{category}_{self.counters[category]}]"
         tag = self.mapping[key]
         self.originals.setdefault(tag, original.strip())
+        return tag
+
+    def _nouveau_tag(self, category: str) -> str:
+        """Tag neuf dont la valeur d'origine est inconnue."""
+        self.counters[category] += 1
+        tag = f"[{category}_{self.counters[category]}]"
+        self.mapping[f"{category}::{tag}"] = tag
+        self.originals[tag] = VALEUR_LLM_INCONNUE
         return tag
 
     def anonymize(self, text: str) -> str:
@@ -1168,37 +1221,38 @@ def ecrire_sorties(dossier: Path, stem: str, result: dict,
 # =============================================================================
 
 def split_into_chunks(text: str, max_chars: int = 4000) -> list[str]:
+    """Découpe le texte en blocs d'au plus `max_chars` caractères.
+
+    Coupe de préférence entre deux paragraphes, sinon entre deux lignes
+    (une ligne plus longue que `max_chars` forme un bloc à elle seule).
+
+    Chaque bloc garde ses séparateurs : `"".join(blocs) == text`. L'ancienne
+    version recollait les blocs avec "\\n\\n", ce qui insérait une ligne vide
+    à chaque coupure — et scindait en deux un tableau markdown plus long
+    qu'un bloc, la seconde moitié perdant son en-tête.
+    """
     if len(text) <= max_chars:
         return [text]
-    paragraphs = re.split(r'\n\s*\n', text)
-    chunks, current, current_len = [], [], 0
-    for para in paragraphs:
-        para_len = len(para) + 2
-        if current_len + para_len > max_chars and current:
-            chunks.append("\n\n".join(current))
-            current, current_len = [para], para_len
+    # [para, séparateur, para, séparateur, ..., para]
+    morceaux = re.split(r'(\n\s*\n)', text)
+    unites: list[str] = []
+    for i in range(0, len(morceaux), 2):
+        para = morceaux[i] + (morceaux[i + 1] if i + 1 < len(morceaux) else "")
+        if len(para) <= max_chars:
+            unites.append(para)
         else:
-            current.append(para)
-            current_len += para_len
-    if current:
-        chunks.append("\n\n".join(current))
-    final_chunks = []
-    for chunk in chunks:
-        if len(chunk) <= max_chars:
-            final_chunks.append(chunk)
+            unites.extend(para.splitlines(keepends=True))
+    blocs: list[str] = []
+    courant = ""
+    for unite in unites:
+        if courant and len(courant) + len(unite) > max_chars:
+            blocs.append(courant)
+            courant = unite
         else:
-            sub_current, sub_len = [], 0
-            for line in chunk.split("\n"):
-                ll = len(line) + 1
-                if sub_len + ll > max_chars and sub_current:
-                    final_chunks.append("\n".join(sub_current))
-                    sub_current, sub_len = [line], ll
-                else:
-                    sub_current.append(line)
-                    sub_len += ll
-            if sub_current:
-                final_chunks.append("\n".join(sub_current))
-    return final_chunks
+            courant += unite
+    if courant:
+        blocs.append(courant)
+    return blocs
 
 
 # =============================================================================
@@ -1311,14 +1365,434 @@ def post_check(text: str) -> list[str]:
     return warnings
 
 
-def count_llm_tags(text: str) -> dict[str, int]:
-    full_tags = re.findall(
-        r'\[(?:PERSONNE|ENTREPRISE|SITE|PROJET|LIEU|REF|SECRET)_\d+\]', text
-    )
-    tag_counts = defaultdict(int)
-    for t in full_tags:
-        tag_counts[t] += 1
-    return dict(tag_counts)
+# =============================================================================
+# RÉCONCILIATION DES RÉPONSES LLM
+# =============================================================================
+
+_MOTIF_TAG = r"\[[A-Z][A-Z_]*_\d+\]"
+# Jetons : un tag entier, un mot ou un signe isolé. Les blancs ne sont pas
+# des jetons : chacun reste attaché au jeton qu'il précède.
+_JETON = re.compile(_MOTIF_TAG + r"|\w+|[^\w\s]")
+_TAG_SEUL = re.compile(_MOTIF_TAG)
+
+# Au-delà de ce nombre de mots supprimés ou réécrits d'un seul tenant (sans
+# tag à la place), ce n'est plus une retouche : c'est une troncature, un
+# résumé ou un exemple du prompt recopié à la place du texte.
+_MOTS_MAX_MODIFIES = 5
+
+# Mots maximum remplacés par un même tag : « Société Nationale des Chemins
+# de fer Français » en fait 7. Au-delà, le LLM a remplacé une phrase. (4 par
+# tag quand plusieurs tags n'ont pas pu être répartis entre leurs entités.)
+_MOTS_MAX_PAR_TAG = 8
+
+
+def _est_tag(jeton: str) -> bool:
+    return jeton.startswith("[") and _TAG_SEUL.fullmatch(jeton) is not None
+
+
+def _est_mot(jeton: str) -> bool:
+    return jeton[:1].isalnum() or jeton[:1] == "_"
+
+
+def _meme_entite(connue: str | None, nouvelle: str) -> bool:
+    """Deux valeurs désignent-elles probablement la même entité ?
+
+    Sert quand le LLM tague un texte avec un tag déjà présent : « M. Dupont »
+    sous le tag de « Jean Dupont » est une reprise légitime, « Marie Curie »
+    sous ce même tag est une collision.
+    """
+    if connue is None or connue == VALEUR_LLM_INCONNUE:
+        return True
+
+    def mots(s: str) -> set[str]:
+        return {m.lower() for m in re.findall(r"\w{3,}", s)}
+
+    return bool(mots(connue) & mots(nouvelle))
+
+
+def _sans_mot(jetons: list[str]) -> bool:
+    return not any(_est_mot(j) for j in jetons)
+
+
+def _nature_blanc(blanc: str) -> int:
+    """0 : collé, 1 : espace, 2 : retour à la ligne."""
+    return 2 if "\n" in blanc else 1 if blanc else 0
+
+
+def _sauts_de_paragraphe(al: "_Alignement", i1: int, i2: int) -> int:
+    """Lignes vides à l'intérieur de a[i1:i2].
+
+    Une entité ne s'étend jamais sur un saut de paragraphe : un passage
+    remplacé par des tags qui en contient un cache du texte supprimé par le
+    LLM (une ligne entière disparue à côté d'une entité).
+    """
+    return sum(1 for k in range(i1 + 1, i2) if al.blancs_a[k].count("\n") >= 2)
+
+
+def _separer_entites(al: "_Alignement", i1: int, i2: int,
+                     j1: int, j2: int) -> list[tuple] | None:
+    """Répartit un passage remplacé par plusieurs tags, un tag par entité.
+
+    « Lyon, Fos-sur-Mer » → « [LIEU_1], [LIEU_2] », ou les cellules d'un
+    tableau « | A | B | » : le séparateur que le LLM a écrit entre deux tags
+    (signes et type de blanc) est cherché dans le texte d'origine. Le
+    découpage n'est retenu que s'il est sans ambiguïté : dans « J.D..\\n
+    usine B2 » → « [PERSONNE_1].\\n[SITE_1] », seul le point suivi du retour
+    à la ligne convient, pas celui de « J. ».
+    """
+    a, b, blancs_a, blancs_b = al.a, al.b, al.blancs_a, al.blancs_b
+    pos_tags = [k for k in range(j1, j2) if _est_tag(b[k])]
+    if len(pos_tags) < 2 or not _sans_mot(b[j1:j2]):
+        return None
+    seps = [[(b[k], _nature_blanc(blancs_b[k])) for k in range(x + 1, y)]
+            + [(None, _nature_blanc(blancs_b[y]))]
+            for x, y in zip(pos_tags, pos_tags[1:])]
+
+    def positions(sep, debut: int, fin: int) -> list[int]:
+        n = len(sep) - 1
+        trouvees = []
+        for q in range(debut, fin - n):
+            if (all(a[q + d] == sep[d][0]
+                    and _nature_blanc(blancs_a[q + d]) == sep[d][1]
+                    for d in range(n))
+                    and _nature_blanc(blancs_a[q + n]) == sep[n][1]):
+                trouvees.append(q)
+        return trouvees
+
+    # Signes recopiés avant le premier tag (« | » d'une cellule) : ce qui
+    # les précède dans l'original a été supprimé par le LLM.
+    ops: list[tuple] = []
+    tete = [(b[k], _nature_blanc(blancs_b[k])) for k in range(j1, pos_tags[0])]
+    if tete:
+        q0 = positions(tete + [(None, _nature_blanc(blancs_b[pos_tags[0]]))],
+                       i1, i2)
+        if len(q0) == 1:
+            if q0[0] > i1:
+                ops.append(("delete", i1, q0[0], j1, j1))
+            ops.append(("equal", q0[0], q0[0] + len(tete), j1, pos_tags[0]))
+            i1, j1 = q0[0] + len(tete), pos_tags[0]
+
+    if all(s == seps[0] for s in seps):
+        coupes = positions(seps[0], i1 + 1, i2)
+        if len(coupes) != len(seps):
+            return None
+    else:
+        coupes = []
+        for s in seps:
+            c = positions(s, i1 + 1, i2)
+            if len(c) != 1 or (coupes and c[0] <= coupes[-1]):
+                return None
+            coupes.append(c[0])
+
+    # Intervalle de chaque entité, côté original et côté réponse.
+    entites, debut_a, debut_b = [], i1, j1
+    for k, q in enumerate(coupes):
+        entites.append([debut_a, q, debut_b, pos_tags[k] + 1])
+        debut_a, debut_b = q + len(seps[k]) - 1, pos_tags[k + 1]
+    entites.append([debut_a, i2, debut_b, j2])
+
+    # Une entité ne franchit pas une ligne vide. Au bord, ce qui est au-delà
+    # du saut de paragraphe a été supprimé par le LLM ; au milieu, le
+    # découpage est faux.
+    sauts = [k for k in range(entites[0][0] + 1, entites[0][1])
+             if blancs_a[k].count("\n") >= 2]
+    suppression_avant = None
+    if sauts:
+        suppression_avant = ("delete", entites[0][0], sauts[-1], j1, j1)
+        entites[0][0] = sauts[-1]
+    sauts = [k for k in range(entites[-1][0] + 1, entites[-1][1])
+             if blancs_a[k].count("\n") >= 2]
+    suppression_apres = None
+    if sauts:
+        suppression_apres = ("delete", sauts[0], entites[-1][1], j2, j2)
+        entites[-1][1] = sauts[0]
+    if any(_sans_mot(a[s:e]) or _sauts_de_paragraphe(al, s, e)
+           for s, e, _, _ in entites):
+        return None
+
+    if suppression_avant:
+        ops.append(suppression_avant)
+    for k, (s, e, t1, t2) in enumerate(entites):
+        ops.append(("replace", s, e, t1, t2))
+        if k < len(coupes) and len(seps[k]) > 1:
+            q = coupes[k]
+            ops.append(("equal", q, q + len(seps[k]) - 1,
+                        pos_tags[k] + 1, pos_tags[k + 1]))
+    if suppression_apres:
+        ops.append(suppression_apres)
+    return ops
+
+
+def _affiner_remplacement(al: "_Alignement",
+                          i1: int, i2: int, j1: int, j2: int) -> list[tuple]:
+    """Décompose un remplacement a[i1:i2] → b[j1:j2] trop grossier."""
+    a, b = al.a, al.b
+    # 1. Jetons communs aux deux bords.
+    p = 0
+    while i1 + p < i2 and j1 + p < j2 and a[i1 + p] == b[j1 + p]:
+        p += 1
+    s = 0
+    while (i2 - s > i1 + p and j2 - s > j1 + p
+           and a[i2 - s - 1] == b[j2 - s - 1]):
+        s += 1
+    avant = [("equal", i1, i1 + p, j1, j1 + p)] if p else []
+    apres = [("equal", i2 - s, i2, j2 - s, j2)] if s else []
+    i1, i2, j1, j2 = i1 + p, i2 - s, j1 + p, j2 - s
+    if i1 == i2 or j1 == j2:
+        nature = "delete" if i1 < i2 else "insert"
+        milieu = [(nature, i1, i2, j1, j2)] if (i1 < i2 or j1 < j2) else []
+        return avant + milieu + apres
+    seg_a, seg_b = a[i1:i2], b[j1:j2]
+
+    # 2. Plusieurs tags pour plusieurs entités voisines.
+    separees = _separer_entites(al, i1, i2, j1, j2)
+    if separees:
+        return avant + separees + apres
+
+    # 3. Texte ajouté collé à une entité : « [PERSONNE_1]. Remarque : ... »
+    # ou « Voici le texte : [PERSONNE_1] ». Les mots ajoutés n'existent pas
+    # dans le passage d'origine ; la coupe se fait au tag, pour que la
+    # ponctuation de l'ajout parte avec lui.
+    k = 0
+    while k < len(seg_b) and not _est_mot(seg_b[k]):
+        k += 1
+    m = len(seg_b)
+    while m > k and not _est_mot(seg_b[m - 1]):
+        m -= 1
+    if k < m:
+        mots_a = {j.lower() for j in seg_a if _est_mot(j)}
+        if not mots_a & {j.lower() for j in seg_b[k:m] if _est_mot(j)}:
+            tags_debut = [x for x in range(k) if _est_tag(seg_b[x])]
+            tags_fin = [x for x in range(m, len(seg_b))
+                        if _est_tag(seg_b[x])]
+            # Un signe d'origine recopié entre le tag et l'ajout (« | » d'une
+            # cellule) reste du côté du remplacement, qui le rapprochera.
+            if tags_debut and not tags_fin:
+                coupe = j1 + tags_debut[-1] + 1
+                for x in range(j1 + k - 1, coupe - 1, -1):
+                    if not _est_tag(a[i2 - 1]) and b[x] == a[i2 - 1]:
+                        coupe = x + 1
+                        break
+                return (avant + _affiner_remplacement(al, i1, i2, j1, coupe)
+                        + [("insert", i2, i2, coupe, j2)] + apres)
+            if tags_fin and not tags_debut:
+                coupe = j1 + tags_fin[0]
+                for x in range(j1 + m, coupe):
+                    if not _est_tag(a[i1]) and b[x] == a[i1]:
+                        coupe = x
+                        break
+                return (avant + [("insert", i1, i1, j1, coupe)]
+                        + _affiner_remplacement(al, i1, i2, coupe, j2)
+                        + apres)
+    return avant + [("replace", i1, i2, j1, j2)] + apres
+
+
+def _nettoyer_ops(al: "_Alignement", ops) -> list[tuple]:
+    """Affine les remplacements de l'alignement global."""
+    propres = []
+    for op, i1, i2, j1, j2 in ops:
+        if op == "replace":
+            propres.extend(_affiner_remplacement(al, i1, i2, j1, j2))
+        else:
+            propres.append((op, i1, i2, j1, j2))
+    return propres
+
+
+def _decouper(texte: str) -> tuple[list[str], list[str], str]:
+    """(jetons, blanc qui précède chaque jeton, blanc final)."""
+    jetons, blancs, pos = [], [], 0
+    for m in _JETON.finditer(texte):
+        blancs.append(texte[pos:m.start()])
+        jetons.append(m.group())
+        pos = m.end()
+    return jetons, blancs, texte[pos:]
+
+
+class _Alignement:
+    """Réponse du LLM alignée jeton par jeton sur le texte envoyé.
+
+    Les blancs sont exclus de l'alignement : ceux du texte envoyé sont
+    toujours conservés, donc le LLM ne peut pas changer la mise en page
+    (lignes vides retirées, retraits de liste perdus).
+    """
+
+    def __init__(self, entree: str, sortie: str):
+        self.a, self.blancs_a, self.fin_a = _decouper(entree)
+        self.b, self.blancs_b, _ = _decouper(sortie)
+        # La ponctuation n'ancre pas l'alignement (elle se rattache aux mots
+        # voisins) : sinon le point de « M. » s'alignait sur le point final
+        # de la phrase, ou sur celui d'un commentaire ajouté par le LLM.
+        self.ops = _nettoyer_ops(self, difflib.SequenceMatcher(
+            lambda j: not (_est_mot(j) or _est_tag(j)),
+            self.a, self.b, autojunk=False).get_opcodes())
+
+    def texte_a(self, i1: int, i2: int) -> str:
+        return "".join(self.blancs_a[k] + self.a[k] for k in range(i1, i2))
+
+    def texte_b(self, j1: int, j2: int) -> str:
+        return "".join(self.blancs_b[k] + self.b[k] for k in range(j1, j2))
+
+    def taille_comparable(self) -> int:
+        """Taille de la réponse, à comparer à celle du texte envoyé.
+
+        Deux corrections, sans quoi une anonymisation correcte était rejetée
+        en bloc — et le bloc restait en clair :
+        - les ajouts purs du LLM ne comptent pas : un préambule (« Voici le
+          texte anonymisé : ») gonflait la réponse au-delà de 130 % ;
+        - un passage remplacé par des tags compte pour la taille du texte
+          remplacé : « Nexans livre. » devenu « [ENTREPRISE_1] livre. »
+          faisait 160 % de l'entrée, le tag étant plus long que le nom.
+        """
+        taille = 0
+        for op, i1, i2, j1, j2 in self.ops:
+            if op == "insert":
+                continue
+            seg_b = self.b[j1:j2]
+            que_des_tags = seg_b and not any(_est_mot(j) for j in seg_b) \
+                and any(_est_tag(j) for j in seg_b)
+            taille += len(self.texte_a(i1, i2) if op == "equal" or que_des_tags
+                          else self.texte_b(j1, j2))
+        return taille
+
+
+def _jouxte_un_tag(jetons: list[str], debut: int, fin: int) -> bool:
+    """Le passage jetons[debut:fin] touche-t-il un tag ?"""
+    return (debut > 0 and _est_tag(jetons[debut - 1])) or (
+        fin < len(jetons) and _est_tag(jetons[fin]))
+
+
+def _apercu(texte: str, n: int = 60) -> str:
+    texte = " ".join(texte.split())
+    return texte if len(texte) <= n else texte[:n - 1] + "…"
+
+
+def reconcilier_reponse(entree: str, sortie: str,
+                        regex_anon: "RegexAnonymizer",
+                        alignement: _Alignement | None = None,
+                        ) -> tuple[str, dict]:
+    """Ne garde de la réponse du LLM que ce qu'il avait le droit de faire.
+
+    La consigne est de remplacer des entités par des tags et de ne RIEN
+    toucher d'autre. La réponse est alignée sur le texte envoyé, puis
+    reconstruite passage par passage :
+
+    - texte → tag : entité remplacée. Le tag est renuméroté dans la
+      numérotation commune au document et le texte remplacé devient sa
+      valeur dans le mapping. Avant, chaque bloc numérotait à partir de 1 :
+      deux sociétés devenaient [ENTREPRISE_1] dans deux blocs, un tag du LLM
+      pouvait reprendre celui d'une entité du dictionnaire, et le mapping
+      n'indiquait que « détecté par LLM ».
+    - passage sans aucun mot (tags, espaces, ponctuation) : remis tel
+      qu'envoyé. Un tag renuméroté ou supprimé, une mise en page modifiée
+      sont corrigés sans risque : rien de lisible n'est rétabli.
+    - ajout pur (préambule, commentaire, exemple du prompt) : retiré. Il
+      n'appartient pas au document et peut citer les valeurs d'origine.
+    - texte supprimé ou réécrit sur `_MOTS_MAX_MODIFIES` mots ou plus :
+      rétabli tel qu'envoyé et signalé (troncature, résumé, exemple recopié
+      à la place du texte). Même politique que le rejet d'un bloc entier :
+      un passage intact mais non anonymisé par le LLM, plutôt qu'un
+      document mutilé.
+    - retouche plus courte : version du LLM gardée (il a pu masquer une
+      donnée autrement que par un tag, rétablir l'original la ferait fuir),
+      mais signalée.
+
+    Retourne (texte reconstruit, bilan).
+    """
+    al = alignement or _Alignement(entree, sortie)
+    a, b, blancs_b = al.a, al.b, al.blancs_b
+    existants = {j for j in a if _est_tag(j)}
+    renommage: dict[str, str] = {}
+    bilan = {"entites": 0, "tags_restaures": 0, "ajouts": [],
+             "retablis": [], "modifications": []}
+    morceaux: list[str] = []
+
+    def tag_global(local: str, valeur: str | None) -> str:
+        categorie = local[1:-1].rsplit("_", 1)[0]
+        candidat = local if local in existants else renommage.get(local)
+        if valeur:
+            cle = f"{categorie}::{valeur.lower()}"
+            if cle in regex_anon.mapping:
+                # Valeur déjà connue (autre bloc, autre passe) : même tag.
+                tag = regex_anon.mapping[cle]
+            elif candidat and _meme_entite(
+                    regex_anon.originals.get(candidat), valeur):
+                tag = candidat
+                regex_anon.mapping[cle] = tag
+                # Tag posé plus tôt sans valeur connue : il prend celle-ci,
+                # sinon il accepterait ensuite n'importe quelle entité.
+                if regex_anon.originals.get(tag) == VALEUR_LLM_INCONNUE:
+                    regex_anon.originals[tag] = valeur
+            else:
+                tag = regex_anon._get_tag(categorie, valeur)
+        else:
+            tag = candidat or regex_anon._nouveau_tag(categorie)
+        if local not in existants:
+            renommage.setdefault(local, tag)
+        return tag
+
+    def emettre_b(j1: int, j2: int, renommer) -> None:
+        """Passage du LLM, précédé du blanc d'origine (posé par l'appelant)."""
+        for k in range(j1, j2):
+            if k > j1:
+                morceaux.append(blancs_b[k])
+            morceaux.append(renommer(b[k]) if _est_tag(b[k]) else b[k])
+
+    for op, i1, i2, j1, j2 in al.ops:
+        if op == "insert":
+            # Ajout pur : retiré, il n'appartient pas au document.
+            if any(_est_mot(j) for j in b[j1:j2]):
+                bilan["ajouts"].append(_apercu(al.texte_b(j1, j2)))
+            continue
+        if op == "equal":
+            morceaux.append(al.texte_a(i1, i2))
+            continue
+        seg_a, seg_b = a[i1:i2], b[j1:j2]
+        mots_a = [j for j in seg_a if _est_mot(j)]
+        mots_b = [j for j in seg_b if _est_mot(j)]
+        tags_a = [j for j in seg_a if _est_tag(j)]
+        tags_b = [j for j in seg_b if _est_tag(j)]
+
+        if not mots_a:
+            # Rien de lisible côté document : on remet ce qui a été envoyé.
+            morceaux.append(al.texte_a(i1, i2))
+            if tags_a and tags_a != tags_b:
+                bilan["tags_restaures"] += 1
+            if mots_b:
+                bilan["ajouts"].append(_apercu(al.texte_b(j1, j2)))
+        elif (tags_b and not tags_a and not mots_b
+              and not _sauts_de_paragraphe(al, i1, i2)
+              # Plusieurs tags que le séparateur n'a pas permis de répartir :
+              # au-delà de quelques mots chacun, du texte a disparu avec.
+              and len(mots_a) <= (_MOTS_MAX_PAR_TAG if len(tags_b) == 1
+                                  else 4 * len(tags_b))):
+            # Entité(s) remplacée(s). La valeur n'est fiable que si un seul
+            # tag remplace le passage.
+            morceaux.append(al.blancs_a[i1])
+            if len(tags_b) == 1:
+                # Le tag seul : une ponctuation ajoutée autour par le LLM
+                # n'appartient pas au document.
+                valeur = " ".join(al.texte_a(i1, i2).split())
+                morceaux.append(tag_global(tags_b[0], valeur))
+            else:
+                emettre_b(j1, j2, lambda t: tag_global(t, None))
+            bilan["entites"] += len(tags_b)
+        elif len(mots_a) >= _MOTS_MAX_MODIFIES:
+            morceaux.append(al.texte_a(i1, i2))
+            bilan["retablis"].append(_apercu(al.texte_a(i1, i2)))
+        else:
+            if seg_b:
+                morceaux.append(al.blancs_a[i1])
+                emettre_b(j1, j2, lambda t: t if t in existants
+                          else tag_global(t, None))
+            # Mot absorbé par un tag voisin (« [PERSONNE_1] Dupont » →
+            # « [PERSONNE_1] ») : comportement attendu, pas une retouche.
+            absorbe = not mots_b and _jouxte_un_tag(a, i1, i2)
+            if mots_a != mots_b and not absorbe:
+                bilan["modifications"].append(
+                    f"« {_apercu(al.texte_a(i1, i2), 40)} » → "
+                    f"« {_apercu(al.texte_b(j1, j2), 40)} »")
+    morceaux.append(al.fin_a)
+    return "".join(morceaux), bilan
 
 
 # =============================================================================
@@ -1390,21 +1864,60 @@ def check_llm(backend: str, base_url: str,
 # PIPELINE PRINCIPAL
 # =============================================================================
 
+def _consigner_bilan(log: "Logger", prefixe: str, bilan: dict):
+    """Journalise et comptabilise ce que la réconciliation a corrigé."""
+    if bilan["entites"]:
+        log.bump("llm_entites", bilan["entites"])
+    if bilan["ajouts"]:
+        log.bump("llm_ajouts_retires", len(bilan["ajouts"]))
+        log.log("WARN", f"{prefixe} texte ajouté par le LLM, retiré : "
+                + ", ".join(f"« {x} »" for x in bilan["ajouts"][:3]))
+    if bilan["tags_restaures"]:
+        log.bump("llm_tags_restaures", bilan["tags_restaures"])
+        log.log("WARN", f"{prefixe} {bilan['tags_restaures']} tag(s) "
+                "existant(s) modifié(s) par le LLM, rétabli(s).")
+    if bilan["retablis"]:
+        log.bump("llm_passages_retablis", len(bilan["retablis"]))
+        log.noter("llm_exemples_retablis", bilan["retablis"])
+        log.log("ERROR", f"{prefixe} passage(s) supprimé(s) ou réécrit(s) "
+                "par le LLM, rétabli(s) SANS anonymisation LLM : "
+                + ", ".join(f"« {x} »" for x in bilan["retablis"][:3]))
+    if bilan["modifications"]:
+        log.bump("llm_modifications", len(bilan["modifications"]))
+        log.noter("llm_exemples_modifications", bilan["modifications"])
+        log.log("WARN", f"{prefixe} retouche(s) hors entités conservée(s) : "
+                + ", ".join(bilan["modifications"][:3]))
+
+
 def _run_llm_pass(chunks, system_prompt, pass_name, log, model, llm_url,
                   timeout, cancel_flag, on_progress,
                   done_chunks_ref, total_chunks, parallel: int = 1,
-                  backend: str = "ollama"):
+                  backend: str = "ollama", regex_anon=None):
     """Execute one LLM pass on a list of chunks. Returns result list.
 
     Les chunks sont indépendants (chacun est un appel de chat isolé), donc
     `parallel` > 1 les envoie de front. Si le moteur ne sert qu'un slot
     (OLLAMA_NUM_PARALLEL=1) les requêtes sont simplement mises en file :
     aucun risque, juste aucun gain.
+
+    `regex_anon` porte la numérotation des tags commune au document (voir
+    `reconcilier_reponse`) ; un registre vierge est pris s'il est omis.
     """
     log.stats["llm_passes"] += 1
     n = len(chunks)
     results: list[str] = list(chunks)
     lock = threading.Lock()
+    registre = regex_anon if regex_anon is not None else RegexAnonymizer()
+
+    def avancer(i: int) -> None:
+        with lock:
+            done_chunks_ref[0] += 1
+            done = done_chunks_ref[0]
+        if on_progress:
+            on_progress(
+                f"{pass_name} — chunk {i}/{n} — {log.elapsed()}",
+                0.2 + (done / total_chunks) * 0.65,
+            )
 
     def process(item) -> None:
         i, chunk = item
@@ -1417,27 +1930,40 @@ def _run_llm_pass(chunks, system_prompt, pass_name, log, model, llm_url,
             results[i - 1] = chunk
             return
 
+        # Les blancs de bord ne partent pas au LLM, qui les retire de toute
+        # façon : ils sont remis tels quels autour de sa réponse, pour que
+        # les blocs se recollent à l'identique.
+        coeur = chunk.strip()
+        if not coeur:
+            avancer(i)
+            return
+        debut = chunk[:len(chunk) - len(chunk.lstrip())]
+        fin = chunk[len(chunk.rstrip()):]
+
         with lock:
             progress = 0.2 + (done_chunks_ref[0] / total_chunks) * 0.65
         log.log(
             "LLM",
-            f"  {pass_name} [{i}/{n}] ({len(chunk)} chars)...",
+            f"  {pass_name} [{i}/{n}] ({len(coeur)} chars)...",
             progress=progress,
         )
-        result, success = call_llm_chat(
-            chunk, system_prompt,
+        reponse, success = call_llm_chat(
+            coeur, system_prompt,
             model=model, base_url=llm_url, timeout=timeout,
             backend=backend,
         )
+        result = coeur
         if success:
+            alignement = _Alignement(coeur, reponse)
             # Garde-fou d'intégrité : un petit modèle peut réécrire le
             # contenu, le tronquer, ou recopier les exemples du prompt au
             # lieu d'anonymiser. L'anonymisation ne fait que remplacer des
             # entités par des tags plus courts : la longueur doit rester
             # dans le même ordre de grandeur. Hors de cette plage, on
             # préfère garder le texte d'origine (non anonymisé mais intact
-            # et signalé) plutôt qu'un document mutilé.
-            ratio = len(result.strip()) / max(len(chunk.strip()), 1)
+            # et signalé) plutôt qu'un document mutilé. Voir
+            # `taille_comparable` : préambule et longueur des tags exclus.
+            ratio = alignement.taille_comparable() / max(len(coeur), 1)
             if not 0.6 <= ratio <= 1.3:
                 log.log(
                     "ERROR",
@@ -1447,16 +1973,24 @@ def _run_llm_pass(chunks, system_prompt, pass_name, log, model, llm_url,
                     "Chunk d'origine conservé.",
                 )
                 log.bump("llm_rejets")
-                result = chunk
-            elif result.strip() == chunk.strip():
-                # Sur une passe de vérification, "aucun changement" est le
-                # résultat attendu quand rien n'a été oublié : ce n'est
-                # anormal que sur la passe d'anonymisation.
-                if "Passe 2" in pass_name:
+            else:
+                # Sous verrou : le registre des tags est partagé entre les
+                # chunks traités en parallèle.
+                with lock:
+                    result, bilan = reconcilier_reponse(
+                        coeur, reponse, registre, alignement)
+                _consigner_bilan(log, f"  {pass_name} [{i}/{n}]", bilan)
+                if bilan["entites"]:
+                    log.log("OK", f"  {pass_name} [{i}/{n}] traité "
+                                  f"({bilan['entites']} entité(s)).")
+                elif "Passe 2" in pass_name:
+                    # Sur une passe de vérification, "aucune entité" est
+                    # le résultat attendu quand rien n'a été oublié : ce
+                    # n'est anormal que sur la passe d'anonymisation.
                     log.log(
                         "WARN",
                         f"  {pass_name} [{i}/{n}] "
-                        "LLM n'a fait aucun changement.",
+                        "LLM n'a remplacé aucune entité.",
                     )
                     log.bump("llm_no_change")
                 else:
@@ -1464,24 +1998,15 @@ def _run_llm_pass(chunks, system_prompt, pass_name, log, model, llm_url,
                         "OK",
                         f"  {pass_name} [{i}/{n}] aucun oubli détecté.",
                     )
-            else:
-                log.log("OK", f"  {pass_name} [{i}/{n}] traité.")
         else:
             log.log(
                 "ERROR" if "Passe 2" in pass_name else "WARN",
                 f"  {pass_name} [{i}/{n}] erreur — texte conservé.",
             )
             log.bump("llm_erreurs")
-        results[i - 1] = result
+        results[i - 1] = debut + result + fin
         log.bump("llm_chunks_traites")
-        with lock:
-            done_chunks_ref[0] += 1
-            done = done_chunks_ref[0]
-        if on_progress:
-            on_progress(
-                f"{pass_name} — chunk {i}/{n} — {log.elapsed()}",
-                0.2 + (done / total_chunks) * 0.65,
-            )
+        avancer(i)
 
     items = list(enumerate(chunks, 1))
     workers = max(1, min(parallel, n))
@@ -1611,36 +2136,28 @@ def run_pipeline(
         chunks = split_into_chunks(text, chunk_size)
         total_chunks = len(chunks) * min(passes, 3)
         done_ref = [0]  # mutable for pass-by-reference
+        tags_avant_llm = set(regex_anon.originals)
 
-        # Passe 2
-        result_chunks = _run_llm_pass(
-            chunks, prompt_p2, "Passe 2", log, model, llm_url,
-            timeout, cancel_flag, on_progress, done_ref, total_chunks,
-            parallel=parallel, backend=backend,
-        )
-        text = "\n\n".join(result_chunks)
+        # Passe 2, puis vérifications. Les blocs gardent leurs séparateurs :
+        # "".join() redonne le document avec sa mise en page d'origine.
+        etapes = [("Passe 2", prompt_p2), ("Passe 3 vérif", prompt_p3),
+                  ("Passe 4 strict", prompt_p3)][:max(1, min(passes, 3))]
+        for numero, (nom_passe, prompt) in enumerate(etapes):
+            if numero and cancel_flag and cancel_flag.is_set():
+                break
+            blocs = chunks if numero == 0 else split_into_chunks(
+                text, chunk_size)
+            text = "".join(_run_llm_pass(
+                blocs, prompt, nom_passe, log, model, llm_url,
+                timeout, cancel_flag, on_progress, done_ref, total_chunks,
+                parallel=parallel, backend=backend, regex_anon=regex_anon,
+            ))
 
-        # Passe 3
-        if passes >= 2 and not (cancel_flag and cancel_flag.is_set()):
-            chunks2 = split_into_chunks(text, chunk_size)
-            result_chunks2 = _run_llm_pass(
-                chunks2, prompt_p3, "Passe 3 vérif", log, model,
-                llm_url, timeout, cancel_flag, on_progress,
-                done_ref, total_chunks, parallel=parallel, backend=backend,
-            )
-            text = "\n\n".join(result_chunks2)
-
-        # Passe 4
-        if passes >= 3 and not (cancel_flag and cancel_flag.is_set()):
-            chunks3 = split_into_chunks(text, chunk_size)
-            result_chunks3 = _run_llm_pass(
-                chunks3, prompt_p3, "Passe 4 strict", log, model,
-                llm_url, timeout, cancel_flag, on_progress,
-                done_ref, total_chunks, parallel=parallel, backend=backend,
-            )
-            text = "\n\n".join(result_chunks3)
-
-        llm_entity_map = count_llm_tags(text)
+        # Tags posés par le LLM, avec leur nombre d'occurrences.
+        llm_entity_map = {
+            tag: text.count(tag) for tag in regex_anon.originals
+            if tag not in tags_avant_llm and tag in text
+        }
     elif not use_llm:
         log.log("INFO", "Passe LLM ignorée.")
 
@@ -1660,6 +2177,14 @@ def run_pipeline(
     # noms, sociétés et lieux de cette portion. C'était jusqu'ici une simple
     # métrique dans le rapport — pour un outil d'anonymisation, ça doit être
     # un avertissement en évidence.
+    if log.stats.get("llm_modifications", 0) > 0:
+        warnings.append(
+            f"À vérifier — {log.stats['llm_modifications']} retouche(s) du "
+            "LLM hors entités, conservées (le modèle a pu masquer une donnée "
+            "autrement que par un tag) : "
+            + ", ".join(log.stats.get("llm_exemples_modifications", []))
+            + ". La consigne était de ne rien modifier d'autre."
+        )
     if log.stats["llm_erreurs"] > 0:
         warnings.insert(0, (
             f"⚠️ {log.stats['llm_erreurs']} chunk(s) NON traité(s) par le LLM "
@@ -1667,6 +2192,16 @@ def run_pipeline(
             "en clair et peuvent encore contenir des noms, sociétés ou lieux. "
             "NE PAS partager ce document sans relecture — augmentez --timeout "
             "ou utilisez un modèle plus léger."
+        ))
+    if log.stats.get("llm_passages_retablis", 0) > 0:
+        warnings.insert(0, (
+            f"⚠️ {log.stats['llm_passages_retablis']} passage(s) supprimé(s) "
+            "ou réécrit(s) par le LLM ont été RÉTABLIS tels quels, donc NON "
+            "anonymisés par le LLM (réponse tronquée, résumée, ou exemple du "
+            "prompt recopié à la place du texte) : "
+            + ", ".join(f"« {x} »" for x in
+                        log.stats.get("llm_exemples_retablis", []))
+            + ". Relisez ces passages avant de partager le document."
         ))
     ignorees = entrees_ignorees(custom_words)
     if ignorees:
@@ -1688,9 +2223,10 @@ def run_pipeline(
         ))
     if log.stats.get("llm_no_change", 0) > 0:
         warnings.insert(0, (
-            f"⚠️ {log.stats['llm_no_change']} chunk(s) renvoyé(s) à "
-            "l'identique par le LLM : le modèle n'a probablement rien "
-            "anonymisé sur ces portions. Vérifiez le modèle choisi."
+            f"⚠️ {log.stats['llm_no_change']} chunk(s) où le LLM n'a "
+            "remplacé aucune entité : le modèle n'a probablement rien "
+            "anonymisé sur ces portions (normal seulement si elles n'en "
+            "contiennent pas). Vérifiez le modèle choisi."
         ))
     if log.stats["annule"]:
         warnings.insert(0, (
@@ -1708,13 +2244,12 @@ def run_pipeline(
     log.stats["duree_totale"] = round(time.time() - log.start_time, 2)
 
     # ── Mapping ──────────────────────────────────────────────
+    # Les tags du LLM y figurent avec le texte qu'ils remplacent (retrouvé
+    # par la réconciliation), ce qui permet de réidentifier une réponse.
     mapping_export = {}
     for key, tag in regex_anon.mapping.items():
         _, normalise = key.split("::", 1)
-        mapping_export[tag] = regex_anon.originals.get(tag, normalise)
-    for tag in llm_entity_map:
-        if tag not in mapping_export:
-            mapping_export[tag] = "⟨détecté par LLM⟩"
+        mapping_export.setdefault(tag, regex_anon.originals.get(tag, normalise))
 
     report = log.generate_report(
         regex_anon, llm_entity_map, images_folder=images_folder,

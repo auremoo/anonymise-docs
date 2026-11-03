@@ -72,8 +72,19 @@ class TestRejetDintegrite(unittest.TestCase):
         self.assertNotIn("beaucoup trop court", r["text"])
 
     def test_reponse_trop_longue_est_rejetee(self):
-        r = _pipeline(lambda t: (t + t, True))
+        """Réécriture qui allonge le texte : rejetée, bloc d'origine gardé."""
+        r = _pipeline(lambda t: (t.replace("e", "eeee"), True))
         self.assertTrue(any("REJET" in w for w in r["warnings"]))
+        self.assertEqual(r["text"], TEXTE)
+
+    def test_reponse_dupliquee_ne_duplique_pas_le_document(self):
+        """Un texte recopié deux fois était rejeté en bloc (taille 200 %).
+        Le doublon est un ajout pur du LLM : il est retiré et le document
+        reste intact. Rien n'ayant été anonymisé, c'est signalé."""
+        r = _pipeline(lambda t: (t + t, True))
+        self.assertEqual(r["text"], TEXTE)
+        self.assertTrue(any("aucune entité" in w for w in r["warnings"]),
+                        r["warnings"])
 
     def test_anonymisation_legitime_nest_pas_rejetee(self):
         """Aucun faux positif : remplacer des entités raccourcit un peu le
@@ -141,8 +152,17 @@ class TestTagsColles(unittest.TestCase):
             self.assertEqual(check_tags_colles(texte), [], texte)
 
     def test_remonte_dans_les_avertissements(self):
-        r = _pipeline(lambda t: (t.replace("Nexans", "[ENTREPRISE_9]-1500"),
-                                 True))
+        """Le cas réel : seul « S7 » de « S7-1500 » est tagué. (Un fragment
+        que le LLM ajouterait lui-même après un tag est retiré par la
+        réconciliation, il ne reste donc rien à signaler dans ce cas-là.)"""
+        with mock.patch.object(anonymize, "check_ollama",
+                               return_value=(True, "ok", ["m"])), \
+             mock.patch.object(anonymize, "call_ollama_chat",
+                               side_effect=lambda t, p, **k: (
+                                   t.replace("S7", "[ENTREPRISE_1]"), True)):
+            r = run_pipeline("Les automates S7-1500 communiquent en Profinet "
+                             "avec le superviseur.", passes=1, verbose=False)
+        self.assertIn("[ENTREPRISE_1]-1500", r["text"])
         self.assertTrue(any("collé" in w for w in r["warnings"]),
                         r["warnings"])
 
@@ -154,8 +174,9 @@ class TestPasseDeVerification(unittest.TestCase):
         oublié : c'est le résultat attendu, pas une anomalie."""
         r = _pipeline(lambda t: (t.replace("Nexans", "[ENTREPRISE_1]"), True),
                       passes=2)
-        self.assertFalse(any("identique" in w for w in r["warnings"]),
+        self.assertFalse(any("aucune entité" in w for w in r["warnings"]),
                          r["warnings"])
+        self.assertEqual(r["warnings"], [])
 
 
 class TestAnnulation(unittest.TestCase):
@@ -280,6 +301,34 @@ class TestDecoupage(unittest.TestCase):
         texte = "\n\n".join(f"para{i}" for i in range(30))
         recolle = "\n\n".join(split_into_chunks(texte, 100))
         self.assertEqual(recolle.replace("\n", ""), texte.replace("\n", ""))
+
+    def test_recollage_a_lidentique(self):
+        """Les blocs étaient recollés avec "\\n\\n" : une ligne vide apparaissait
+        à chaque coupure, y compris au milieu d'un tableau."""
+        textes = [
+            "\n\n".join(f"para{i} " + "mot " * 15 for i in range(30)),
+            "| a | b |\n|---|---|\n"
+            + "".join(f"| ligne{i} | val{i} |\n" for i in range(80)),
+            "  retrait\n\n\n\ntrois lignes vides\r\n\r\nfin windows\n" * 40,
+            "x" * 5000,
+        ]
+        for texte in textes:
+            blocs = split_into_chunks(texte, 300)
+            self.assertEqual("".join(blocs), texte)
+            self.assertTrue(all(len(b) <= 300 for b in blocs)
+                            or texte == "x" * 5000)
+
+    def test_tableau_preserve_par_le_pipeline(self):
+        """Même avec un LLM qui retire les blancs de bord de sa réponse."""
+        table = ("| a | b |\n|---|---|\n"
+                 + "".join(f"| ligne{i} | val{i} |\n" for i in range(80)))
+        with mock.patch.object(anonymize, "check_ollama",
+                               return_value=(True, "ok", ["m"])), \
+             mock.patch.object(anonymize, "call_ollama_chat",
+                               side_effect=lambda t, p, **k: (
+                                   "\n" + t.strip() + "\n\n", True)):
+            r = run_pipeline(table, passes=2, chunk_size=300, verbose=False)
+        self.assertEqual(r["text"], table)
 
 
 class TestVerificationFinale(unittest.TestCase):
