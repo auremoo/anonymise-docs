@@ -695,6 +695,12 @@ def call_ollama_chat(text: str, system_prompt: str, model: str = "mistral:latest
         )
         response.raise_for_status()
         data = response.json()
+        # Réponse coupée par num_predict : la fin du chunk manque. Même cas
+        # que finish_reason « length » chez LM Studio ; au-delà de 60 % de
+        # la taille, le garde-fou d'intégrité la laissait passer et la fin
+        # du texte disparaissait du document.
+        if data.get("done_reason") == "length":
+            return text, False
         result = _nettoyer_reponse(data.get("message", {}).get("content", ""))
         if not result:
             return text, False

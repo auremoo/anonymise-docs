@@ -217,6 +217,35 @@ class TestParallelisation(unittest.TestCase):
         self.assertEqual(log.stats.get("llm_rejets", 0), 0)
 
 
+class TestAppelOllama(unittest.TestCase):
+
+    TEXTE = "La societe Nexans a mandate Jean Dupont sur le site."
+
+    def _appel(self, corps):
+        reponse = mock.Mock(status_code=200)
+        reponse.json.return_value = corps
+        with mock.patch.object(anonymize._SESSION, "post",
+                               return_value=reponse):
+            return anonymize.call_ollama_chat(self.TEXTE, "p")
+
+    def test_reponse_normale(self):
+        anonyme = "La societe [ENTREPRISE_1] a mandate [PERSONNE_1] sur le site."
+        self.assertEqual(
+            self._appel({"message": {"content": anonyme},
+                         "done_reason": "stop"}),
+            (anonyme, True))
+
+    def test_reponse_tronquee_est_un_echec(self):
+        """Coupée par num_predict, la réponse perdait la fin du chunk. Le cas
+        était traité pour LM Studio (finish_reason) mais pas pour Ollama :
+        au-delà de 60 % de la taille, la fin du texte disparaissait."""
+        self.assertEqual(
+            self._appel({"message": {"content": "La societe [ENTREPRISE_1] "
+                                                "a mandate [PERSONNE_1]"},
+                         "done_reason": "length"}),
+            (self.TEXTE, False))
+
+
 class TestDimensionnementContexte(unittest.TestCase):
     """num_ctx était figé à 32768 : un cache KV de 32k tokens alloué pour
     des chunks de quelques milliers de caractères."""
