@@ -47,12 +47,16 @@ Fichier source → read_file_with_images()  read_file_bytes_with_images()
 | `normaliser_texte()` | Ramène la typographie docx/pdf à l'ASCII avant toute recherche (tirets unicode, espaces insécables, coupures de ligne) |
 | `load_sensitive_words()` / `save_sensitive_words()` | Chargement/sauvegarde du dictionnaire persistant `sensitive-words.json` |
 | `RegexAnonymizer` | Passe 1 — patterns structurés (IP, email, dates, FQDN, chemins, téléphones, credentials) |
-| `call_ollama_chat()` | Appel Ollama via `/api/chat` avec system prompt — session HTTP réutilisée, `keep_alive: 10m` |
+| `call_ollama_chat()` | Appel Ollama via `/api/chat` avec system prompt — session HTTP réutilisée, `keep_alive: 10m`, `done_reason: length` traité comme un échec (comme `finish_reason` chez LM Studio) |
+| `reconcilier_reponse()` | Aligne la réponse du LLM sur le texte envoyé et ne garde que les remplacements entité → tag (voir « Réconciliation des réponses LLM ») |
+| `_Alignement` | Alignement jeton par jeton (`difflib`, ponctuation non ancrante, blancs exclus) + `taille_comparable()` pour le rejet d'intégrité |
+| `decoder_texte()` | Décodage des formats texte : UTF-8 avec ou sans BOM, UTF-16 avec BOM, repli Windows-1252 (CSV d'Excel) |
+| `_Images` | Collecteur d'images extraites : une image répétée (logo sur chaque page) garde un seul numéro |
 | `call_lmstudio_chat()` | Appel LM Studio via `/v1/chat/completions` (API OpenAI). Réflexion coupée (`reasoning_effort: none`, sauf gpt-oss), `finish_reason: length` traité comme un échec, `<think>` retiré |
 | `call_llm_chat()` / `check_llm()` | Aiguillage selon `backend` (`ollama` / `lmstudio`) — `BACKENDS` donne nom, URL et modèle par défaut |
 | `check_lmstudio()` | Liste les modèles de chat via `/api/v0/models` (écarte les modèles d'embedding), repli `/v1/models` |
 | `_size_context()` | Calcule `num_ctx`/`num_predict` selon la taille du chunk (évite d'allouer 32k tokens de cache KV pour 4k caractères) |
-| `split_into_chunks()` | Découpage intelligent (paragraphes > lignes) |
+| `split_into_chunks()` | Découpage intelligent (paragraphes > lignes). Chaque bloc garde ses séparateurs : `"".join(blocs) == texte` (l'ancien recollage par `"\n\n"` insérait une ligne vide à chaque coupure, au milieu des tableaux) |
 | `post_check()` | Vérification finale regex pour patterns résiduels |
 | `Logger` | Traçabilité complète + callback UI + génération du rapport + timer (`elapsed()`) |
 | `read_file()` / `read_file_bytes()` | Lecture multi-format (fichier disque / bytes mémoire) — texte seulement |
@@ -74,7 +78,8 @@ garde `backend="ollama"` par défaut (les tests simulent `check_ollama`).
 | Engine selector | Radio Ollama / LM Studio, défaut `DEFAULT_BACKEND` |
 | Model selector | Selectbox peuplé par `check_ollama()` (modèles installés) |
 | File uploader | Drag & drop de documents (disabled pendant l'exécution) |
-| Data editor | Tableau dynamique de mots custom à anonymiser (pré-rempli depuis `sensitive-words.json`) |
+| Data editor | Tableau dynamique de mots custom à anonymiser (pré-rempli depuis `sensitive-words.json`). Cellules vides lues par `_cellule()` : une ligne laissée vide revenait en None/NaN et devenait le mot « None » ou la catégorie « NAN » |
+| Rattachement | `_traitement_partage()` (`st.cache_resource`) garde le dernier traitement du serveur : une page rechargée ou un second onglet s'y rattache (progression, bouton Arrêter) au lieu de proposer d'en lancer un second sur le même GPU |
 | Save dictionary | Bouton pour sauvegarder les mots custom dans `sensitive-words.json` |
 | Éditeur JSON | Expander pour éditer/coller le dictionnaire en bloc — bien plus rapide que la saisie ligne par ligne. Validation stricte : un JSON mal formé est refusé sans écraser le fichier existant |
 | Image extraction | Checkbox pour activer l'extraction d'images docx/pdf |
@@ -127,8 +132,9 @@ lieux et nom de projet tagués, 16/16 termes techniques préservés. Mais `DV260
 `DOC-B-123`, `PR-QSE-07`, `REF-INT-2024-88` **restés en clair** (mistral
 attrapait les deux premiers), et `bâtiment B2V` tagué `[LIEU_4]`. La
 numérotation par chunk produit des collisions réelles : « Beltech » est
-`[ENTREPRISE_2]` dans le chunk 1 et `[ENTREPRISE_1]` dans le chunk 2.
-Conclusion inchangée : les références vont dans le dictionnaire.
+`[ENTREPRISE_2]` dans le chunk 1 et `[ENTREPRISE_1]` dans le chunk 2
+(corrigé depuis par la réconciliation, voir plus bas : même valeur, même
+tag). Conclusion inchangée : les références vont dans le dictionnaire.
 
 La réflexion doit rester coupée : c'est `call_lmstudio_chat()` qui
 l'impose, pas un réglage de LM Studio.
@@ -267,16 +273,20 @@ irréductible et le GPU est le goulot. Les seuls vrais leviers :
 | 1500 | 170 s | 3 |
 
 Chunks plus petits = plus rapide (coût quadratique de l'attention) et
-moins d'oublis en fin de chunk. Contrepartie : la numérotation des tags
-LLM n'est pas cohérente entre chunks (chaque chunk repart de son propre
-comptage), donc deux sociétés différentes peuvent devenir `[ENTREPRISE_1]`
-dans deux chunks distincts.
+moins d'oublis en fin de chunk. Le LLM numérote ses tags par chunk ; la
+réconciliation les renumérote dans le registre commun du document, donc
+deux sociétés différentes ne fusionnent plus sous `[ENTREPRISE_1]`.
 
 ### Extraction d'images — correspondance vérifiée
 
 Le numéro du placeholder `[IMAGE_N]` et le nom de fichier `IMAGE_N.ext`
 sont alignés par construction : l'index dans la liste `images` sert aux
 deux. Vérifié par test sur des images de couleurs distinctes.
+
+Une image répétée (même contenu, empreinte SHA-256) garde son numéro : un
+logo sur chaque page d'un PDF donne un fichier et autant de
+`[IMAGE_1]` que de pages, au lieu d'un fichier identique par page. Côté
+PDF, chaque `xref` n'est décodé qu'une fois.
 
 | Emplacement de l'image | docx | pdf |
 |---|---|---|
@@ -300,20 +310,67 @@ une table de relations vide (aucun placeholder émis).
 
 | Contrôle | Déclenchement |
 |---|---|
-| Rejet d'intégrité | Réponse LLM hors de 60–130 % de la taille d'entrée → chunk d'origine conservé et signalé (attrape la réécriture/troncature) |
+| Rejet d'intégrité | Réponse LLM hors de 60–130 % de la taille d'entrée → chunk d'origine conservé et signalé (attrape la réécriture/troncature). Taille mesurée par `taille_comparable()` : préambule exclu, entité comptée à la taille du texte qu'elle remplace — sinon « Nexans livre. » → « [ENTREPRISE_1] livre. » (160 %) était rejeté et restait en clair |
+| Réconciliation | `reconcilier_reponse()` — ajouts du LLM retirés, tags existants rétablis, passages supprimés/réécrits ≥ 5 mots **rétablis et signalés**, retouches plus courtes gardées mais signalées (« À vérifier ») |
+| Troncature | `done_reason`/`finish_reason` « length » → échec, chunk conservé et signalé |
 | Vocabulaire de tags | `check_tag_vocabulary()` — catégorie inventée (`[MARQUE_TECHNIQUE_1]`…) = sur-anonymisation de termes techniques |
 | Tags collés | `check_tags_colles()` — un tag suivi d'un fragment (`[ENTREPRISE_1]-1500`) révèle que le LLM n'a tagué qu'une partie d'une référence technique. La catégorie étant légitime, c'est le seul signal disponible |
 | Entrées ignorées | `entrees_ignorees()` — motif à joker trop large, écarté et signalé dans les avertissements |
 | Fragments numériques | `check_fragments_numeriques()` — un nombre isolé après un tag (`[REF_1] 123`) peut être la fin d'une référence coupée par un espace insécable. Signal moins sûr : formulé comme une vérification |
 | Chunks non traités | Timeout ou Ollama absent → portion restée en clair, avertissement en tête des warnings |
 
-Ces trois cas remontent dans `result["warnings"]`, donc dans le rapport,
+Ces cas remontent dans `result["warnings"]`, donc dans le rapport,
 dans l'UI Streamlit et en fin de run CLI. **Un document peut être produit
 en n'étant que partiellement anonymisé — c'est le mode d'échec principal
 de l'outil et il doit rester visible.**
 
+### Réconciliation des réponses LLM
+
+La consigne est de remplacer des entités par des tags et de ne rien
+toucher d'autre. `reconcilier_reponse()` aligne chaque réponse sur le
+texte envoyé (`_Alignement`) et la reconstruit :
+
+| Écart du LLM | Traitement |
+|---|---|
+| Texte → tag | Tag renuméroté dans le registre commun (`RegexAnonymizer`), texte remplacé = valeur du mapping. Même valeur → même tag dans tout le document ; tag du LLM qui reprend celui d'une autre entité → tag neuf (« M. Dupont » sous le tag de « Jean Dupont » reste une reprise : mot commun) |
+| Préambule, commentaire, exemple du prompt ajouté | Retiré (il peut citer les valeurs d'origine) |
+| Tag existant renuméroté ou supprimé, blancs ou ponctuation modifiés | Rétabli tel qu'envoyé — rien de lisible n'est rétabli |
+| ≥ 5 mots supprimés ou réécrits sans tag | **Rétablis** et signalés en tête des avertissements (troncature, résumé) |
+| Retouche plus courte | Gardée (le LLM a pu masquer une donnée autrement), signalée « À vérifier » |
+
+Avant : le mapping ne donnait que `⟨détecté par LLM⟩` pour les entités du
+LLM, deux entités pouvaient partager un tag, et un préambule faisait
+rejeter le bloc entier (resté en clair). Le rapport liste maintenant
+chaque entité du LLM avec sa valeur : c'est là que se voit un
+`TGBT` → `[ENTREPRISE_N]`.
+
+Points délicats de l'alignement, chacun couvert par un test :
+- la ponctuation n'ancre pas l'alignement global (le point de « M. »
+  s'alignait sur le point final) ;
+- plusieurs tags dans un même passage sont répartis en cherchant dans
+  l'original le séparateur exact écrit par le LLM (signes + type de blanc),
+  seulement s'il est sans ambiguïté — sinon tags sans valeur, texte sûr ;
+- une entité ne franchit pas une ligne vide.
+
+Mesuré par fuzz (hors dépôt) : 10 000 réponses simulées (numérotation
+locale arbitraire, préambule, commentaire, blancs modifiés) → **0 écart**
+à la restitution exacte. Avec en plus une phrase supprimée ou une fin
+tronquée (3000 cas) → 26 pertes non signalées, toutes du même motif :
+**réponse arrêtée exactement sur un tag**, la fin du bloc est absorbée
+dans la dernière entité (visible seulement dans la valeur du mapping).
+Laissé ainsi : le détecter ferait fuir des entités en minuscules. Coût :
+~3 ms par bloc de 1500 caractères.
+
 - **Streamlit** — interface web locale bilingue FR/EN
-- **Dépendances** : `requests`, `python-docx`, `pymupdf`, `streamlit`, `pandas`
+- **Dépendances** : `requests`, `python-docx`, `pymupdf<2`, `streamlit`, `pandas`.
+  PyMuPDF 2 tire onnxruntime, networkx et des modèles de mise en page
+  (~120 Mo mesurés) inutiles ici ; le code importe `pymupdf` (le nom
+  `fitz` est déprécié) et fonctionne avec les deux versions.
+- **Windows, chemins longs** : avec le Python du Microsoft Store,
+  `site-packages` fait 148 caractères ; Streamlit 1.66 y dépasse la limite
+  de 260 (288), onnxruntime aussi (273) → `pip install` échoue si
+  `LongPathsEnabled` vaut 0. `lancer.bat` crée donc `.venv` dans le projet
+  quand le Python système n'a pas les dépendances (mesuré : 65 s).
 
 ## Conventions
 
@@ -433,8 +490,8 @@ n'anonymisait rien du tout.
 python -m unittest discover -s tests -t .
 ```
 
-131 tests, sans dépendance externe, sans Ollama ni LM Studio (les appels
-LLM sont simulés). Les documents docx/pdf de test sont **générés à l'exécution** :
+168 tests, sans dépendance externe, sans Ollama ni LM Studio (les appels
+LLM sont simulés). Verts avec `pymupdf` 1.28 comme 2.1. Les documents docx/pdf de test sont **générés à l'exécution** :
 le `.gitignore` exclut `*.docx` et `*.pdf` pour éviter de commiter un
 document sensible par accident.
 
@@ -442,8 +499,10 @@ document sensible par accident.
 |---|---|
 | `test_regex.py` | Passe 1 — chaque test correspond à un bug rencontré, y compris les cas qui ne doivent **pas** matcher (termes techniques, mots avalés) |
 | `test_dictionnaire.py` | Passe 0 — casse, joker `*`, tags fantômes, fichier de dictionnaire |
-| `test_extraction.py` | docx/pdf — correspondance placeholder ↔ fichier vérifiée **par la couleur des pixels** (un simple comptage ne détecte pas un décalage de numérotation) |
-| `test_garde_fous.py` | Rejet d'intégrité, catégories inventées, chunks non traités, annulation, ordre des chunks en parallèle |
+| `test_extraction.py` | docx/pdf — correspondance placeholder ↔ fichier vérifiée **par la couleur des pixels** (un simple comptage ne détecte pas un décalage de numérotation), images répétées, encodages (Windows-1252, BOM, UTF-16), console non UTF-8 |
+| `test_garde_fous.py` | Rejet d'intégrité, catégories inventées, chunks non traités, annulation, ordre des chunks en parallèle, troncature Ollama, recollage des blocs à l'identique |
+| `test_reconciliation.py` | Numérotation commune des tags (collisions, même entité d'un bloc à l'autre, parallélisme), valeurs du mapping, préambule/commentaire retirés, tags rétablis, troncature et exemple recopié rétablis |
+| `test_interface_traitement.py` | Traitement lancé depuis l'interface de bout en bout (dépôt de fichier simulé) ; page rechargée pendant un traitement : rattachement et arrêt. Nécessite un Streamlit récent (`AppTest.file_uploader`), sinon ignoré |
 | `test_interface_json.py` | Éditeur JSON de l'UI, exécuté via `AppTest` de Streamlit (saisie → clic → écriture → relecture). `check_llm` y est simulé : sinon l'état du moteur sur la machine faisait échouer les tests |
 | `test_sorties.py` | Un dossier par document dans `output/` (CLI et interface), ordre du panneau « Fichiers déjà produits », fichiers cachés ignorés — sur un `output/` temporaire |
 | `test_lmstudio.py` | Backend LM Studio — format de requête, réflexion coupée, réponse tronquée/vide, repli sans `reasoning_effort`, filtrage des embeddings, aiguillage du pipeline |
@@ -456,7 +515,8 @@ gardant le journal complet dans le rapport.
 ```bash
 # Lanceur tout-en-un (demarre le moteur LLM si besoin + interface web)
 python lancer.py
-# ou double-clic sur lancer.bat (Windows, Ollama)
+# ou double-clic sur lancer.bat (Windows, Ollama — .venv, puis Python systeme
+#   s'il a les dependances, sinon cree .venv au 1er lancement)
 # ou double-clic sur lancer.command (Mac, LM Studio — cree .venv au 1er lancement)
 python lancer.py --backend ollama   # forcer le moteur
 

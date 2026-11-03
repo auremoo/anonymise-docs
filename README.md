@@ -53,11 +53,17 @@ Each document gets its own folder, `output/<name>/` in the project, so
 outputs of several documents never mix. The CLI and the web interface
 use the same folder (`--output-dir` to change it for the CLI).
 
+The mapping also holds the entities tagged by the LLM, with the text each
+tag replaced, so an answer from a cloud AI can be de-anonymized. The report
+lists them in a table: review it — a technical term tagged by mistake (e.g.
+"TGBT" as a company) is only visible there.
+
 ### Image extraction
 
 The `[IMAGE_N]` placeholder left in the text and the `IMAGE_N.ext` file on
 disk always carry the same number, so you can match each placeholder to the
-exact file it replaced.
+exact file it replaced. An image that appears several times (a logo on
+every page) keeps a single number: one file to review, not one per page.
 
 | Image location | .docx | .pdf |
 |---|---|---|
@@ -147,6 +153,14 @@ ollama serve
 ```
 
 ### 3. Install Python dependencies
+
+On Windows, `lancer.bat` does it for you: if the system Python lacks the
+dependencies, it creates a `.venv` in the project folder on first run (the
+only time it accesses the network). An environment inside the project
+folder also avoids the 260-character Windows path limit, which some
+Streamlit files exceed when installed with the Microsoft Store Python.
+
+By hand:
 
 ```bash
 pip install -r requirements.txt
@@ -282,6 +296,9 @@ Features:
 - LLM engine selector (Ollama / LM Studio) and model selector (auto-detects installed models)
 - Real-time progress bar with elapsed time
 - Stop button to cancel long-running anonymization
+- Reloading the page (or opening a second tab) during a run re-attaches to
+  it — progress and Stop button included — and no second run can start
+  meanwhile on the same GPU
 - Image extraction from docx/pdf (saved as numbered files, downloadable as zip)
 - Before/after preview
 - Download anonymized file, mapping, report, and images
@@ -379,6 +396,15 @@ Pas besoin de lancer `ollama serve` à la main : `lancer.py` le démarre.
 
 ### 3. Installer les dépendances Python
 
+Sous Windows, `lancer.bat` s'en charge : si le Python du système n'a pas
+les dépendances, il crée un `.venv` dans le dossier du projet au premier
+lancement (seul moment où il accède au réseau). Un environnement dans le
+dossier du projet évite aussi la limite de 260 caractères des chemins
+Windows, que dépassent certains fichiers de Streamlit installés avec le
+Python du Microsoft Store.
+
+À la main :
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -416,6 +442,9 @@ Ouvre une interface dans le navigateur avec :
 - Choix du moteur (Ollama / LM Studio) et du modèle (détection automatique des modèles installés)
 - Barre de progression en temps réel avec chronomètre
 - Bouton d'arrêt pour annuler un traitement long
+- Recharger la page (ou ouvrir un second onglet) pendant un traitement s'y
+  rattache — progression et bouton Arrêter compris — et aucun second
+  traitement ne peut partir en parallèle sur le même GPU
 - Extraction d'images depuis docx/pdf (fichiers numérotés, téléchargeables en zip)
 - Prévisualisation avant/après
 - Téléchargement des résultats (fichier anonymisé, mapping, rapport, images)
@@ -492,7 +521,9 @@ Accepter des espaces dans le joker le ferait déborder sur le mot suivant.
 
 Le placeholder `[IMAGE_N]` laissé dans le texte et le fichier `IMAGE_N.ext`
 sur le disque portent toujours le même numéro : la correspondance est exacte,
-vous pouvez retrouver quel fichier remplace quel emplacement.
+vous pouvez retrouver quel fichier remplace quel emplacement. Une image
+présente plusieurs fois (logo sur chaque page) garde un seul numéro : un
+fichier à vérifier, et non un par page.
 
 | Emplacement de l'image | .docx | .pdf |
 |---|---|---|
@@ -519,6 +550,11 @@ les sorties de plusieurs documents ne se mélangent plus. Le CLI et
 l'interface utilisent le même dossier (`--output-dir` pour le changer en
 CLI).
 
+Le mapping contient aussi les entités taguées par le LLM, avec le texte que
+chaque tag remplace : la réponse d'une IA cloud peut donc être
+réidentifiée. Le rapport les liste dans un tableau à relire — un terme
+technique tagué à tort (« TGBT » en société) n'est visible que là.
+
 ## Workflow typique
 
 ```
@@ -534,7 +570,7 @@ CLI).
 python -m unittest discover -s tests -t .
 ```
 
-131 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama ni de LM Studio (les
+168 tests, aucune dépendance supplémentaire, aucun besoin d'Ollama ni de LM Studio (les
 appels LLM sont simulés). Les documents docx/pdf de test sont générés à
 l'exécution — aucun fichier binaire n'est stocké dans le dépôt.
 
