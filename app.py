@@ -219,11 +219,22 @@ TEXTS = {
         "FR": "Fichiers sauvegardés dans",
         "EN": "Files saved to",
     },
+    "pipeline_error": {
+        "FR": "Erreur du traitement : ",
+        "EN": "Processing error: ",
+    },
+    "llm_errors": {
+        "FR": "LLM : {n} erreur(s) — certains chunks n'ont pas été traités "
+              "par le LLM. Vérifiez que {moteur} est lancé et que le modèle "
+              "répond.",
+        "EN": "LLM: {n} error(s) — some chunks were not processed by the "
+              "LLM. Check that {moteur} is running and the model responds.",
+    },
     "llm_no_change": {
-        "FR": "chunk(s) retourné(s) identiques par le LLM — "
+        "FR": "chunk(s) où le LLM n'a remplacé aucune entité — "
               "le modèle ne semble pas anonymiser. "
               "Essayez un modèle plus grand ou vérifiez qu'il est adapté au NER.",
-        "EN": "chunk(s) returned identical by LLM — "
+        "EN": "chunk(s) where the LLM replaced no entity — "
               "the model does not seem to anonymize. "
               "Try a larger model or check it supports NER.",
     },
@@ -421,6 +432,25 @@ st.set_page_config(
 # STATE
 # =============================================================================
 
+@st.cache_resource
+def _traitement_partage() -> dict:
+    """Dernier traitement lancé sur ce serveur, commun à toutes les sessions.
+
+    `st.session_state` est propre à une session : recharger la page pendant
+    un traitement de plusieurs heures en créait une neuve, qui ne voyait plus
+    ni la progression ni le bouton Arrêter — et laissait lancer un second
+    traitement en parallèle sur le même GPU. Une session neuve, ou un autre
+    onglet pendant un traitement, se rattache donc à celui-ci.
+    """
+    return {}
+
+
+partage = _traitement_partage()
+if partage and (partage["pipe"]["running"] or "pipe" not in st.session_state):
+    st.session_state.pipe = partage["pipe"]
+    st.session_state.cancel_flag = partage["cancel_flag"]
+    st.session_state.filename_stem = partage["stem"]
+
 # Shared dict for background thread communication.
 # The thread writes to this dict directly (not via st.session_state)
 # which avoids Streamlit's "missing ScriptRunContext" warnings.
@@ -434,6 +464,7 @@ if "pipe" not in st.session_state:
         "cancelling": False,
         "original_text": None,
         "images": [],
+        "images_zip": None,
     }
 
 if "cancel_flag" not in st.session_state:
@@ -586,14 +617,23 @@ edited_df = st.data_editor(
     disabled=pipe["running"],
 )
 
+def _cellule(valeur) -> str:
+    """Texte d'une cellule du tableau, "" si elle est vide.
+
+    Une ligne ajoutée puis laissée vide revient en None ou NaN : str() en
+    faisait le mot « None » ou « nan », et une catégorie vide devenait la
+    catégorie « NAN ».
+    """
+    return "" if pd.isna(valeur) else str(valeur).strip()
+
+
 def _mots_du_tableau() -> dict[str, str]:
     """Lignes non vides du tableau -> {mot: catégorie}."""
     mots = {}
     for _, row in edited_df.iterrows():
-        mot = str(row[col_word]).strip()
-        cat = str(row[col_cat]).strip()
-        if mot and mot.lower() != "nan":
-            mots[mot] = cat or "PERSONNE"
+        mot = _cellule(row[col_word])
+        if mot:
+            mots[mot] = _cellule(row[col_cat]) or "PERSONNE"
     return mots
 
 
@@ -781,7 +821,10 @@ if stop_clicked:
 
 # ── Start pipeline (background thread) ──────────────────────
 
-if run_clicked:
+# Le bouton a pu être cliqué dans un onglet affiché avant qu'un traitement
+# ne démarre ailleurs : la session vient alors de s'y rattacher (voir
+# _traitement_partage) et ne doit pas en lancer un second.
+if run_clicked and not pipe["running"]:
     # Reset shared state
     pipe["running"] = True
     pipe["result"] = None
@@ -793,19 +836,19 @@ if run_clicked:
     pipe["cancelling"] = False
     pipe["original_text"] = None
     pipe["images"] = []
+    pipe["images_zip"] = None
 
     st.session_state.cancel_flag = threading.Event()
 
-    # Prepare custom words
-    custom_words = {}
-    for _, row in edited_df.iterrows():
-        word = str(row[col_word]).strip()
-        cat = str(row[col_cat]).strip()
-        if word:
-            custom_words[word] = cat
+    # Même lecture du tableau que pour la sauvegarde : la boucle d'ici ne
+    # filtrait ni « None » ni « nan », et une catégorie vide donnait des
+    # tags « [_1] ».
+    custom_words = _mots_du_tableau()
 
     filename_stem = Path(uploaded_file.name).stem
     st.session_state.filename_stem = filename_stem
+    partage.update(pipe=pipe, cancel_flag=st.session_state.cancel_flag,
+                   stem=filename_stem)
 
     # Capture references for the thread (no st.session_state access)
     _pipe = pipe
@@ -977,7 +1020,7 @@ if not pipe["running"] and OUTPUT_DIR.exists():
 # ── Pipeline error ───────────────────────────────────────────
 
 if pipe["error"]:
-    st.error(f"Pipeline error: {pipe['error']}")
+    st.error(f"{t('pipeline_error')}{pipe['error']}")
     pipe["error"] = None
 
 # ── Results ──────────────────────────────────────────────────
@@ -1019,11 +1062,7 @@ if pipe["result"] is not None:
 
     # LLM error warnings
     if stats.get("llm_erreurs", 0) > 0:
-        st.error(
-            f"LLM: {stats['llm_erreurs']} erreur(s) — "
-            "certains chunks n'ont pas été traités par le LLM. "
-            f"Vérifiez que {MOTEUR} est lancé et que le modèle répond."
-        )
+        st.error(t("llm_errors", n=stats["llm_erreurs"], moteur=MOTEUR))
 
     if stats.get("llm_no_change", 0) > 0:
         st.warning(
@@ -1101,21 +1140,22 @@ if pipe["result"] is not None:
         )
 
     if images:
-        # Zip construit une seule fois par document : le bloc r\u00e9sultats est
-        # re-rendu \u00e0 chaque rerun (changement de langue, clic sur un onglet)
-        # et recompresser toutes les images \u00e0 chaque fois ne sert \u00e0 rien.
-        zip_key = f"_images_zip_{filename_stem}"
-        if zip_key not in st.session_state:
+        # Zip construit une seule fois par traitement : le bloc résultats est
+        # re-rendu à chaque rerun (changement de langue, clic sur un onglet)
+        # et recompresser toutes les images à chaque fois ne sert à rien.
+        # Rangé avec le traitement, pas sous le nom du document : retraiter
+        # un document du même nom resservait l'ancien zip.
+        if pipe.get("images_zip") is None:
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
                 for i, (img_data, ext) in enumerate(images, 1):
                     zf.writestr(f"IMAGE_{i}.{ext}", img_data)
-            st.session_state[zip_key] = zip_buffer.getvalue()
+            pipe["images_zip"] = zip_buffer.getvalue()
 
         with dl_cols[3]:
             st.download_button(
                 f"\u2b07\ufe0f {t('dl_images')}",
-                data=st.session_state[zip_key],
+                data=pipe["images_zip"],
                 file_name=f"{filename_stem}_images.zip",
                 mime="application/zip",
                 width="stretch",

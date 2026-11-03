@@ -127,6 +127,24 @@ class TestEditeurJson(unittest.TestCase):
         self.assertEqual(anonymize.load_sensitive_words(self.dico),
                          {"FLOTTATION-A3": "PROCESS"})
 
+    def test_lignes_vides_du_tableau_ignorees(self):
+        """Une ligne ajoutée au tableau puis laissée vide revient en None ou
+        NaN : str() en faisait le mot « None » ou « nan », enregistré dans
+        le dictionnaire et anonymisé partout dans le document. Une catégorie
+        vide donnait la catégorie « NONE »."""
+        import pandas as pd
+        at = AppTest.from_file(APP, default_timeout=90)
+        at.session_state["custom_words_df"] = pd.DataFrame(
+            [["Nexans", "ENTREPRISE"], [None, None],
+             [float("nan"), "PERSONNE"], ["Jean Dupont", None]],
+            columns=["Mot / Nom", "Catégorie"])
+        at.run()
+        at = [b for b in at.button
+              if "Sauvegarder" in b.label][0].click().run()
+        self.assertEqual(list(at.exception), [])
+        self.assertEqual(anonymize.load_sensitive_words(self.dico),
+                         {"Nexans": "ENTREPRISE", "Jean Dupont": "PERSONNE"})
+
     def test_editeur_prerempli_depuis_le_fichier(self):
         anonymize.save_sensitive_words(
             {"Nexans": "ENTREPRISE"}, self.dico)
